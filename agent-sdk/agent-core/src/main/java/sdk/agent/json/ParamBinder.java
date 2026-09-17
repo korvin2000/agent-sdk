@@ -142,8 +142,7 @@ public final class ParamBinder {
                 errors.add(new Violation(path.isEmpty() ? c.getName() : path, "must have required property '" + c.getName() + "'"));
                 continue;
             }
-            args[i] = convert(c.getGenericType(), member, join(path, c.getName()), errors);
-            if (args[i] == null && c.getType().isPrimitive()) args[i] = zero(c.getType());
+            args[i] = convert(c.getGenericType(), member, join(path, c.getName()), errors);   // null only with a violation recorded
         }
         if (errors.size() > before) return null;
         try {
@@ -156,15 +155,6 @@ public final class ParamBinder {
         } catch (ReflectiveOperationException e) {
             throw new IllegalStateException("cannot instantiate parameter record " + raw.getName(), e);
         }
-    }
-
-    private static Object zero(Class<?> primitive) {
-        if (primitive == boolean.class) return false;
-        if (primitive == char.class) return '\0';
-        if (primitive == double.class) return 0d;
-        if (primitive == float.class) return 0f;
-        if (primitive == long.class) return 0L;
-        return 0;
     }
 
     private static String typeWord(Class<?> raw) {

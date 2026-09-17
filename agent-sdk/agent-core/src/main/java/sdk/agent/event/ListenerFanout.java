@@ -43,9 +43,6 @@ public final class ListenerFanout implements EventSink {
         }
     }
 
-    /// Listeners have no error channel; `RunEnd` carries the outcome.
-    @Override public void fail(Throwable cause) { }
-
     /// Agent-level: listeners outlive runs.
     @Override public void close() { }
 }

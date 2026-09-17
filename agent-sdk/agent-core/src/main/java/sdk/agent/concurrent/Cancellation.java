@@ -30,21 +30,7 @@ public final class Cancellation {
 
     public static Cancellation create() { return new Cancellation(); }
 
-    /// ONE-WAY, parent → child. Cancelling the parent cancels the child; cancelling the child never
-    /// touches the parent — a sub-agent that gives up must not be able to kill the run that spawned it.
-    public static Cancellation linkedTo(Cancellation parent) {
-        var child = new Cancellation();
-        Registration link = parent.onCancel(child::cancel);
-        child.onCancel(link::close);                     // a child cancelled on its own stops listening
-        return child;
-    }
-
     public boolean isCancelled() { return cancelled.get(); }
-
-    /// @throws CancelledException if cancelled
-    public void throwIfCancelled() {
-        if (cancelled.get()) throw new CancelledException();
-    }
 
     /// Fires immediately (on the calling thread) if already cancelled.
     public Registration onCancel(Runnable listener) {

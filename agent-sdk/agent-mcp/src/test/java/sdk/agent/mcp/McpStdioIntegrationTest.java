@@ -57,7 +57,8 @@ class McpStdioIntegrationTest {
 
         McpInitResult result = extension.initResults().getFirst();
         assertTrue(result.connected(), () -> "connect failed: " + result.error().orElse("?"));
-        tools = extension.contributions().toolProviders().getFirst().catalog().tools();
+        tools = new java.util.LinkedHashMap<>();
+        for (Tool<?> t : extension.contributions().toolProviders().getFirst().tools()) tools.put(t.name(), t);
     }
 
     @AfterAll

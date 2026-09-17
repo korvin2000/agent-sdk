@@ -101,13 +101,13 @@ public sealed interface Json permits Json.Null, Json.Bool, Json.Num, Json.Str, J
 
     // ---- text ----------------------------------------------------------------------------
 
-    /// Strict parse through [JsonCodec#DEFAULT].
+    /// Strict RFC 8259 parse.
     /// @throws JsonParseException on any syntax error, trailing garbage, or nesting deeper than 512
-    static Json parse(CharSequence text) { return JsonCodec.DEFAULT.parse(text); }
+    static Json parse(CharSequence text) { return JsonText.parse(text); }
 
     /// Compact, canonical text: no whitespace, members in insertion order.
-    default String toText()       { return JsonCodec.DEFAULT.write(this); }
+    default String toText()       { return JsonText.write(this, false); }
 
     /// Two-space pretty text, byte-compatible with JavaScript's `JSON.stringify(x, null, 2)`.
-    default String toPrettyText() { return JsonCodec.DEFAULT.writePretty(this); }
+    default String toPrettyText() { return JsonText.write(this, true); }
 }

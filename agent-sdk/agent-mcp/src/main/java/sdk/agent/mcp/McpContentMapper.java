@@ -21,7 +21,7 @@ import sdk.agent.tool.ToolResult;
 ///
 /// `McpSchema.Content` is **not sealed** in mcp-core 2.0.1 (verified: `public interface
 /// McpSchema$Content extends McpSchema$Meta`, no `permits`), so the `default` arm below is
-/// present, exactly as §4.14.4 prints it. It is a **visible degradation, never a silent drop**:
+/// present. It is a **visible degradation, never a silent drop**:
 /// the model still sees that a block existed and what kind it was.
 final class McpContentMapper {
 

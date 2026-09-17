@@ -17,7 +17,7 @@ public sealed interface StepOutcome {
         public Needs { events = List.copyOf(events); }
     }
 
-    record Finished(List<AgentEvent> events, TurnState state, TurnResult result) implements StepOutcome {
+    record Finished(List<AgentEvent> events, TurnState state) implements StepOutcome {
         public Finished { events = List.copyOf(events); }
     }
 

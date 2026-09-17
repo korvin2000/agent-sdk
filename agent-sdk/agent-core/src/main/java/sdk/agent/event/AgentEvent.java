@@ -10,7 +10,7 @@ import sdk.agent.message.ToolResultMessage;
 import sdk.agent.provider.LlmStreamEvent;
 import sdk.agent.tool.ToolResult;
 
-/// The ten events a run emits — the same ten as pi-mono. Every event carries `runId` and
+/// The ten events a run emits. Every event carries `runId` and
 /// `turnIndex` (`-1` for run-scoped events) so two loops can share one sink and a session can be
 /// rebuilt from a persisted event log. There is exactly one terminal event, [RunEnd], whose
 /// `produced` list is complete on every path including failure.
@@ -44,11 +44,10 @@ public sealed interface AgentEvent {
 
     record MessageEnd(String runId, int turnIndex, Instant at, AgentMessage message) implements AgentEvent { }
 
-    /// `rawArguments` is always present. `boundArguments` is null until binding succeeds — and
-    /// `ToolStart` is emitted before prepare/bind, so on the engine's own path it is always null.
-    /// A host that needs both in one place uses the `BeforeToolCall` hook.
+    /// `arguments` are the raw arguments as the model sent them; `ToolStart` is emitted before they
+    /// are validated, so a host that needs the bound form uses the `BeforeToolCall` hook.
     record ToolStart(String runId, int turnIndex, Instant at, String toolCallId,
-                     String toolName, Json rawArguments, Json boundArguments) implements AgentEvent { }
+                     String toolName, Json arguments) implements AgentEvent { }
 
     record ToolUpdate(String runId, int turnIndex, Instant at, String toolCallId,
                       String toolName, ToolResult partial) implements AgentEvent { }

@@ -2,40 +2,24 @@ package sdk.agent.mcp;
 
 import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Objects;
-import java.util.concurrent.Flow;
-import java.util.concurrent.SubmissionPublisher;
 
 import sdk.agent.tool.Tool;
-import sdk.agent.tool.ToolCatalog;
 import sdk.agent.tool.ToolProvider;
 
 /// The one thing this module contributes to an agent. A `ToolProvider`, not a fixed tool list,
-/// because the catalog changes on `tools/list_changed`: a **new** immutable snapshot is published
-/// and the `volatile` reference is swapped. A registry is never mutated in place.
-final class McpToolProvider implements ToolProvider, AutoCloseable {
+/// because the set changes on `tools/list_changed`: a **new** immutable list is published and the
+/// `volatile` reference is swapped; the agent rebuilds its registry from it at the next run.
+final class McpToolProvider implements ToolProvider {
 
     private static final System.Logger LOG = System.getLogger(McpToolProvider.class.getName());
 
-    /// Same-thread delivery: no executor to own, nothing to shut down beyond the publisher, and no
-    /// virtual thread started outside `sdk.agent.concurrent`.
-    private final SubmissionPublisher<ToolCatalog> updates =
-            new SubmissionPublisher<>(Runnable::run, Flow.defaultBufferSize());
-
-    private volatile ToolCatalog catalog = ToolCatalog.EMPTY;
+    private volatile List<Tool<?>> tools = List.of();
 
     @Override public String id() { return McpExtension.ID; }
 
-    @Override public ToolCatalog catalog() { return catalog; }
+    @Override public List<Tool<?>> tools() { return tools; }
 
-    @Override public Flow.Publisher<ToolCatalog> catalogUpdates() { return updates; }
-
-    void publish(ToolCatalog next) {
-        this.catalog = Objects.requireNonNull(next, "catalog");
-        if (!updates.isClosed()) updates.submit(next);
-    }
-
-    @Override public void close() { updates.close(); }
+    void publish(List<Tool<?>> next) { this.tools = List.copyOf(next); }
 
     /// A **composed-name collision is a hard error at registration, naming both owners**. Only
     /// sanitisation or truncation can produce one, and silently overwriting would route calls to
@@ -45,7 +29,7 @@ final class McpToolProvider implements ToolProvider, AutoCloseable {
     ///               `false` on a later `tools/list_changed`, where the newly arrived duplicate is
     ///               dropped with a logged error naming both owners and everything else keeps
     ///               working. Either way the collision is visible and nothing is misrouted.
-    static ToolCatalog catalogOf(List<McpToolAdapter> adapters, boolean strict) {
+    static List<Tool<?>> catalogOf(List<McpToolAdapter> adapters, boolean strict) {
         var byName = new LinkedHashMap<String, Tool<?>>();
         var owners = new LinkedHashMap<String, String>();
         for (McpToolAdapter adapter : adapters) {
@@ -60,6 +44,6 @@ final class McpToolProvider implements ToolProvider, AutoCloseable {
             }
             byName.put(name, adapter);
         }
-        return new ToolCatalog(byName);
+        return List.copyOf(byName.values());
     }
 }

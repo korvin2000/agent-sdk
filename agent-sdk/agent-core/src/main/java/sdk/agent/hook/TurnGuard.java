@@ -1,8 +1,10 @@
 package sdk.agent.hook;
 
+import java.time.Instant;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
+import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -42,10 +44,21 @@ import sdk.agent.tool.ToolRegistry;
 /// | max turns | `turnsUsed >= maxTurns` | `Stop` (MAX_TURNS), no message |
 /// | final turn | `turnsUsed == maxTurns - 1` | `beforeRequest` strips the tools and adds a transient instruction |
 ///
-/// Every reprompt is a `UserMessage`, never a system message (several providers reject a
-/// mid-conversation system message). The six strings are verbatim from nanocoder, tiny-coding-agent
-/// and mini-swe-agent (MIT — see THIRD-PARTY-NOTICES.md).
+/// A failing turn of one kind increments that tier's counter and **zeroes every other** (a
+/// different failure mode is evidence this one is not a streak); a healthy turn **decays** every
+/// counter by one, so a model alternating malformed and valid turns cannot burn the whole budget
+/// without tripping a cap. Every reprompt is a `UserMessage`, never a system message (several
+/// providers reject a mid-conversation system message). The six strings are verbatim from
+/// nanocoder, tiny-coding-agent and mini-swe-agent (MIT — see THIRD-PARTY-NOTICES.md).
 public final class TurnGuard implements AgentHooks {
+
+    /// The six streak tiers: three windows over recent tool calls, three consecutive-turn counters.
+    /// The N-th failing turn of a kind is refused, where N is the tier's cap.
+    public enum Thrash { REPEATED, SAME_TOOL, DOMINANT, EMPTY, MALFORMED, TRUNCATED }
+
+    public static final Map<Thrash, Integer> DEFAULT_CAPS = Map.of(
+            Thrash.REPEATED, 3, Thrash.SAME_TOOL, 5, Thrash.DOMINANT, 8,
+            Thrash.EMPTY, 2, Thrash.MALFORMED, 2, Thrash.TRUNCATED, 2);
 
     /// nanocoder `conversation.ts:108-113`
     public static final String TRUNCATED_TURN_INSTRUCTION = """
@@ -84,12 +97,16 @@ public final class TurnGuard implements AgentHooks {
     private final Map<Thrash, Integer> caps;
     private final ConcurrentMap<String, RunWatch> runs = new ConcurrentHashMap<>();
 
+    /// @throws IllegalArgumentException naming the first tier whose cap is missing or below one
     public TurnGuard(Map<Thrash, Integer> caps) {
-        new ThrashCounters(caps);                         // validates eagerly, naming the missing tier
+        for (Thrash t : Thrash.values()) {
+            Integer cap = caps.get(t);
+            if (cap == null || cap < 1) throw new IllegalArgumentException("cap for " + t + " must be >= 1, was " + cap);
+        }
         this.caps = Map.copyOf(caps);
     }
 
-    public static TurnGuard defaults() { return new TurnGuard(ThrashCounters.defaultCaps()); }
+    public static TurnGuard defaults() { return new TurnGuard(DEFAULT_CAPS); }
 
     // ---- the guard point ----------------------------------------------------------------------
 
@@ -101,37 +118,38 @@ public final class TurnGuard implements AgentHooks {
             return new TurnVerdict.Stop(new RunOutcome.LimitExceeded(RunOutcome.Limit.MAX_TURNS, "turn cap reached: " + maxTurns), null);
         }
         RunWatch w = runs.computeIfAbsent(ctx.runId(), _ -> new RunWatch(caps));
+        Instant now = ctx.clock().instant();
 
         if (m.stopReason() == StopReason.TOOL_USE && calls.isEmpty()) {
-            return streak(w, Thrash.TRUNCATED, STOPPED_WITHOUT_TOOL_CALL_INSTRUCTION.formatted(m.stopReason().name().toLowerCase(Locale.ROOT)));
+            return streak(w, Thrash.TRUNCATED, STOPPED_WITHOUT_TOOL_CALL_INSTRUCTION.formatted(m.stopReason().name().toLowerCase(Locale.ROOT)), now);
         }
         if (m.stopReason() == StopReason.LENGTH && calls.isEmpty() && !m.text().isBlank()) {
-            return streak(w, Thrash.TRUNCATED, TRUNCATED_TURN_INSTRUCTION);
+            return streak(w, Thrash.TRUNCATED, TRUNCATED_TURN_INSTRUCTION, now);
         }
         if (!calls.isEmpty()) {
             List<Optional<String>> problems = calls.stream().map(c -> preflight(c, ctx.tools())).toList();
             if (m.stopReason() == StopReason.TOOL_USE && problems.stream().allMatch(Optional::isPresent)) {
-                return streak(w, Thrash.MALFORMED, malformed(calls, problems, ctx.tools()));
+                return streak(w, Thrash.MALFORMED, malformed(calls, problems, ctx.tools()), now);
             }
             w.record(calls);
             String name = calls.getFirst().name();
             if (w.repeatedBatches() >= caps.get(Thrash.REPEATED)) {
-                return stop("identical tool batch on " + caps.get(Thrash.REPEATED) + " consecutive turns", name);
+                return stop("identical tool batch on " + caps.get(Thrash.REPEATED) + " consecutive turns", name, now);
             }
             if (w.sameToolRun() >= caps.get(Thrash.SAME_TOOL)) {
-                return stop("same tool on " + caps.get(Thrash.SAME_TOOL) + " consecutive calls", name);
+                return stop("same tool on " + caps.get(Thrash.SAME_TOOL) + " consecutive calls", name, now);
             }
             if (w.dominantCount() >= caps.get(Thrash.DOMINANT)) {
-                w.counters.tripped(Thrash.DOMINANT);
-                return new TurnVerdict.Retry(UserMessage.text(LOOP_DETECTED.formatted(w.dominantName())), "dominant tool call signature");
+                w.tripped(Thrash.DOMINANT);
+                return new TurnVerdict.Retry(UserMessage.text(LOOP_DETECTED.formatted(w.dominantName()), now), "dominant tool call signature");
             }
-            w.counters.healthy();
+            w.healthy();
             return TurnVerdict.PROCEED;
         }
         if (m.text().isBlank() && !m.terminal()) {
-            return streak(w, Thrash.EMPTY, CONTINUE_NUDGE);
+            return streak(w, Thrash.EMPTY, CONTINUE_NUDGE, now);
         }
-        w.counters.healthy();
+        w.healthy();
         return TurnVerdict.PROCEED;
     }
 
@@ -149,17 +167,17 @@ public final class TurnGuard implements AgentHooks {
 
     // ---- classification helpers ---------------------------------------------------------------
 
-    private static TurnVerdict streak(RunWatch w, Thrash kind, String reprompt) {
-        if (w.counters.tripped(kind)) {
+    private static TurnVerdict streak(RunWatch w, Thrash kind, String reprompt, Instant now) {
+        if (w.tripped(kind)) {
             return new TurnVerdict.Stop(new RunOutcome.LimitExceeded(RunOutcome.Limit.THRASH,
-                    kind.name().toLowerCase(Locale.ROOT) + " turn cap reached: " + w.counters.cap(kind)), null);
+                    kind.name().toLowerCase(Locale.ROOT) + " turn cap reached: " + w.caps.get(kind)), null);
         }
-        return new TurnVerdict.Retry(UserMessage.text(reprompt), kind.name().toLowerCase(Locale.ROOT));
+        return new TurnVerdict.Retry(UserMessage.text(reprompt, now), kind.name().toLowerCase(Locale.ROOT));
     }
 
-    private static TurnVerdict stop(String detail, String toolName) {
+    private static TurnVerdict stop(String detail, String toolName, Instant now) {
         return new TurnVerdict.Stop(new RunOutcome.LimitExceeded(RunOutcome.Limit.THRASH, detail),
-                UserMessage.text(LOOP_DETECTED.formatted(toolName)));
+                UserMessage.text(LOOP_DETECTED.formatted(toolName), now));
     }
 
     /// "Usable" is decided exactly as the funnel decides it: known name, parseable arguments, and a
@@ -200,13 +218,27 @@ public final class TurnGuard implements AgentHooks {
 
     /// Per-run window and counters. Touched only by the driver thread of its run.
     private static final class RunWatch {
-        final ThrashCounters counters;
+        final Map<Thrash, Integer> caps;
+        final EnumMap<Thrash, Integer> counts = new EnumMap<>(Thrash.class);
         final Deque<Set<ToolCallSignature>> batches = new ArrayDeque<>();
         final Deque<Call> calls = new ArrayDeque<>();
 
-        RunWatch(Map<Thrash, Integer> caps) { counters = new ThrashCounters(caps); }
+        RunWatch(Map<Thrash, Integer> caps) {
+            this.caps = caps;
+            for (Thrash t : Thrash.values()) counts.put(t, 0);
+        }
 
         private record Call(String name, ToolCallSignature signature) { }
+
+        /// A failing turn of `kind`: increment mine, zero every other. `true` when the cap is reached.
+        boolean tripped(Thrash kind) {
+            int n = counts.merge(kind, 1, Integer::sum);
+            for (Thrash other : Thrash.values()) if (other != kind) counts.put(other, 0);
+            return n >= caps.get(kind);
+        }
+
+        /// A healthy turn: decay every counter by one.
+        void healthy() { counts.replaceAll((_, v) -> Math.max(0, v - 1)); }
 
         void record(List<ContentBlock.ToolCall> toolCalls) {
             var batch = new LinkedHashSet<ToolCallSignature>();

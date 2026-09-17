@@ -6,8 +6,8 @@ import sdk.agent.concurrent.Cancellation;
 import sdk.agent.json.Json;
 
 /// Everything one tool call receives, as one record — so a later field does not break every tool.
-/// `cancel` is passed explicitly because tools are third-party code and must not depend on a
-/// scoped binding being present.
+/// `cancel` is the run's token: a long-running tool polls it, registers a callback on it, or lets
+/// the interrupt it raises end a blocking call.
 ///
 /// @param <P> the bound parameter type
 public record ToolInvocation<P>(String toolCallId,

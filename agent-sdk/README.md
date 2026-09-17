@@ -3,9 +3,9 @@
 A small, dependency-free SDK for building coding agents: a **pure turn state machine**, a run engine
 that owns the I/O, an event stream with twelve enforced invariants, a tool contract with schema
 derivation and validation, hooks for policy, four base tools (`read`, `write`, `edit`, `bash`) and
-kon's tiny system prompt — a few lines of base text plus what the workspace adds. Built from scratch
-in Java 26 (records, sealed types, pattern matching, virtual threads, `ScopedValue`, sequenced
-collections) — no preview features, so any JDK ≥ 26 consumer can use it.
+a short system prompt that grows only with what the workspace adds (`AGENTS.md`, skills, git
+status). Built in plain Java 26 — records, sealed types, pattern matching, virtual threads — with
+no preview features, so any JDK ≥ 26 consumer can use it.
 
 ```
 agent-sdk/
@@ -18,13 +18,20 @@ agent-sdk/
 `agent-mcp` is the only module with third-party dependencies; drop it from the classpath and a host
 loses one `.extension(new McpExtension(servers))` line and nothing else.
 
+**The connection to a model is not part of this project.** `sdk.agent.provider.LlmProvider` is the
+seam; `AnthropicProvider` and `OpenAiProvider` are empty placeholders whose documentation says how
+the core protocol maps onto each API. The protocol is provider-neutral by construction: tool calls
+stream as `(id, name)` plus argument fragments, reasoning blocks carry an opaque `signature`, and
+`ThinkingLevel` and `StopReason` map one to one onto both APIs' effort levels and finish reasons.
+
 ## Build
 
-Requires JDK 26 and Gradle 9.7 (both are under `../tools`).
+Requires JDK 26 and Gradle 9.7 (both are under `../tools`). Point `JAVA_HOME` at the JDK; Gradle
+picks it up as the current JVM (toolchain auto-download is off).
 
 ```bash
-export JAVA_HOME=/c/work.ai/coding_agents/tools/jdk-26.0.2.1+1
-/c/work.ai/coding_agents/tools/gradle-9.7.1/bin/gradle -p /c/work.ai/coding_agents/agent-sdk build
+export JAVA_HOME=/c/work.ai/agent-sdk/tools/jdk-26.0.2.1+1
+/c/work.ai/agent-sdk/tools/gradle-9.7.1/bin/gradle -p /c/work.ai/agent-sdk/agent-sdk build
 ```
 
 `build` compiles with `-Xlint:all -Werror`, runs every test, checks that `agent-core` has no runtime
@@ -41,7 +48,7 @@ var env = ToolEnvironment.builder(Path.of("/path/to/workspace"))
 try (var agent = AgentBuilder.create()
         .provider(myLlmProvider)                      // implements sdk.agent.provider.LlmProvider
         .extension(new CodingToolsExtension(env))     // read, bash, edit, write + the system prompt
-        .model(new ModelRef("anthropic", "anthropic", "claude-sonnet-5", 200_000, 8_192))
+        .model(new ModelRef("anthropic", "anthropic", "claude-opus-5", 1_000_000, 128_000))
         .limits(RunLimits.DEFAULTS.withMaxTurns(50))
         .build()) {
 
@@ -75,18 +82,20 @@ hooks, run a tool batch) and returning only at durable checkpoints; `RunState` i
 serialises at every boundary, `RunDeps` are the live collaborators supplied fresh each time. Every
 tool call leaves the `ToolFunnel` through one exit, so a `ToolStart` always gets its `ToolEnd` and
 its `ToolResultMessage`, in assistant source order, whatever went wrong. `Agent` is a thin facade
-over one live run, two message queues and a listener fan-out.
+over one live run, two message queues and a listener fan-out; it rebuilds the `ToolRegistry` from
+the extensions' `ToolProvider`s at every run start, which is how a dynamic source such as MCP
+`tools/list_changed` reaches the model.
 
 ## System prompt and commands
 
-The prompt follows kon: a short base text, then only what this workspace adds. Every piece of prompt
-text is a markdown template under `agent-tools/src/main/resources/sdk/agent/tools/prompts/`, rendered
-through `PromptTemplate` (`${name}` placeholders, a missing value fails loudly). Nothing is cached;
-the prompt is built once per run.
+A short base text, then only what this workspace adds. Every piece of prompt text is a markdown
+template under `agent-tools/src/main/resources/sdk/agent/tools/prompts/`, rendered through
+`PromptTemplate` (`${name}` placeholders, a missing value fails loudly). Nothing is cached; the
+prompt is built once per run.
 
 | Order | Section | Template | Content |
 |---:|---|---|---|
-| 0 | base | `system-prompt.md` | kon's default text, or the host's own |
+| 0 | base | `system-prompt.md` | the default text, or the host's own |
 | 10 | tool-usage | `tool-usage.md` | every registered tool's `promptGuidelines()`, duplicates dropped |
 | 20 | project-context | `project-context.md` | `AGENTS.md`/`CLAUDE.md` from the git root down to the workspace |
 | 30 | skills | `skills.md` | `.agents/skills/*/SKILL.md` in the workspace, its ancestors and `~/.agents/skills` |
@@ -102,6 +111,28 @@ commands only.
 `CodingPrompts(env, baseText, gitContext)` swaps the base text or drops the git snapshot;
 `AgentBuilder.systemPromptOverride(...)` replaces or appends to the assembled prompt as a whole.
 
+## The tools
+
+`ToolEnvironment` is the one object the four tools share: workspace root and `PathPolicy`
+(containment plus a write deny-set for `.git`/`.hg`/`.svn`), the session's `FileVersions`, the
+shell (discovered lazily — Git Bash locations and `PATH` on Windows, rejecting the WSL launcher in
+`System32`; `/bin/bash` then `PATH` then `sh` elsewhere — or supplied), output limits, and two
+switches: `lineNumbers` on `read` (off by default so `edit` gets byte-exact text) and
+`readBeforeOverwrite` on `write` (on by default: a lost-update guard, not a permission check).
+
+- `read` streams one pass to EOF, materialising only the requested window while counting the whole
+  file; an image (png, jpeg, gif, webp, sniffed by magic number) comes back as one image block.
+- `write` is atomic and adopts the existing file's BOM and line endings.
+- `edit` applies many exact replacements all-or-nothing against the original text, echoes the
+  changed region with line numbers, and refuses with a compare-and-swap if the file changed on disk
+  since the session read it (the session carries the version — the model never does).
+- `bash` closes stdin, drains both pipes concurrently, frames `EXIT_CODE`/`STDERR`/`STDOUT`,
+  tail-truncates with the true totals, spills the full output to a temp file, and kills the process
+  tree with a real SIGTERM grace on timeout or abort.
+
+A refusal on the way to the model is a `ToolException` (unchecked, message-only); the funnel turns
+any `ToolFailure` into an error result with its `ErrorKind`.
+
 ## Extending
 
 An `Extension` declares `Contributions` — tools, tool providers, prompt sections, hooks, message
@@ -116,14 +147,15 @@ duplicate section ids, duplicate codecs all fail at `build()` naming both owners
   `PromptContributor`; load its text with `PromptTemplate.read(MyClass.class.getResourceAsStream("x.md"), "x.md")`
   and pick an order between the base pack's (0–50) or after them. A blank render drops the section.
 - **Policy** (permissions, sandboxing, loop detection, compaction) is an `AgentHooks`
-  implementation. `beforeToolCall` is the permissions seam; `transformContext` is the compaction
+  implementation. `beforeToolCall` is the permissions seam — it may block a call or rewrite its
+  arguments (a sandbox prefix on a `bash` command lives here); `transformContext` is the compaction
   seam (per-request, non-destructive); `beforeRequest` rewrites the request before it is sent;
   `afterAssistant` can `Retry` (reprompt) or `Stop` the run. `TurnGuard` ships as the default
   loop/budget policy and is replaceable with `AgentBuilder.turnGuard(...)`.
 - **Custom transcript entries** implement `AgentMessage` and register an `AgentMessageCodec` so
   they survive checkpoint and resume.
-- **Another execution backend** (SSH, container): build one `ToolEnvironment` with your
-  `ReadOperations`/`WriteOperations`/`BashOperations`/`BashSpawnHook` and every tool follows.
+- **A dynamic tool source** implements `ToolProvider` and returns a new list from `tools()`
+  whenever its set changes; the next run registers it.
 
 ## Guarantees worth knowing
 
@@ -133,10 +165,8 @@ duplicate section ids, duplicate codecs all fail at `build()` naming both owners
 - A failed turn is a message with `stopReason ∈ {ERROR, ABORTED}`, never an exception; a run's
   outcome is a sealed `RunOutcome`, never a thrown one.
 - Cancellation reaches work through the flag, thread interrupt and callbacks at once; five
-  checkpoints in the engine observe it; `Fork.close()` can never hang.
-- `read` never materialises a whole file; `write` is atomic and preserves BOM/line endings;
-  `edit` is all-or-nothing with a hash compare-and-swap; `bash` closes stdin, drains both pipes
-  concurrently, kills the process tree with a real SIGTERM grace, and reports true output totals.
+  checkpoints in the engine observe it; `Fork.close()` can never hang; `agent.abort()` never blocks
+  on a child process.
 
 ## Licence notices
 

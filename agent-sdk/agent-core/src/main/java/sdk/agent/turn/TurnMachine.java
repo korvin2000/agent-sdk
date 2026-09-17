@@ -86,7 +86,7 @@ public final class TurnMachine {
             case LlmStreamEvent.ThinkingEnd(var index, var text, var sig, var redacted) -> { b.openBlock = Optional.of(open(b, OpenBlock.Kind.THINKING, index).finish(text, sig, redacted)); closeOpen(b); }
             case LlmStreamEvent.ToolCallStart(var index, var id, var name, var initial) -> {
                 closeOpen(b);
-                b.activeCalls.put(index, new ArgAccumulator(id, name, "", initial, null));
+                b.activeCalls.put(index, new ArgAccumulator(id, name, "", initial));
             }
             case LlmStreamEvent.ToolCallDelta(var index, var fragment, var replace) -> {
                 ArgAccumulator acc = b.activeCalls.get(index);
@@ -118,7 +118,7 @@ public final class TurnMachine {
         return kind == OpenBlock.Kind.TEXT ? OpenBlock.text(index) : OpenBlock.thinking(index);
     }
 
-    /// kon `turn.py:517-544`: whitespace-only text never opens a block; an empty thinking block
+    /// Whitespace-only text never opens a block; an empty thinking block
     /// survives only if it carries a signature or is redacted (required for redacted-reasoning round trips).
     private static void closeOpen(TurnState.Builder b) {
         b.openBlock.ifPresent(open -> {
@@ -148,7 +148,7 @@ public final class TurnMachine {
         return new StepOutcome.Needs(events, next, new Need.Verdict(next.assistant()));
     }
 
-    /// The stale-snapshot rule (kon `turn.py:145-204`): on a parse failure fall back to the
+    /// The stale-snapshot rule: on a parse failure fall back to the
     /// start-of-call snapshot **only if the stream did not stall** — after a stall the snapshot
     /// is stale and the fragments are truncated, so the call is marked unusable instead.
     private static void flushActiveCalls(TurnState.Builder b, boolean stalled) {
@@ -172,7 +172,7 @@ public final class TurnMachine {
                     }
                 }
             }
-            b.content.add(new ContentBlock.ToolCall(acc.toolCallId(), acc.toolName(), arguments, acc.thoughtSignature()));
+            b.content.add(new ContentBlock.ToolCall(acc.toolCallId(), acc.toolName(), arguments, null));
         }
         b.activeCalls.clear();
     }
@@ -237,12 +237,9 @@ public final class TurnMachine {
     private static StepOutcome close(TurnState.Builder b, List<AgentEvent> before, Instant now) {
         b.phase = TurnPhase.CLOSED;
         TurnState next = b.build();
-        AssistantMessage assistant = next.assistant();
-        List<ToolResultMessage> results = next.results();
         var events = new ArrayList<>(before);
-        events.add(new AgentEvent.TurnEnd(next.runId(), next.index(), now, assistant, results));
-        return new StepOutcome.Finished(events, next,
-                new TurnResult(assistant, results, assistant.stopReason(), assistant.usage(), next.stalled()));
+        events.add(new AgentEvent.TurnEnd(next.runId(), next.index(), now, next.assistant(), next.results()));
+        return new StepOutcome.Finished(events, next);
     }
 
     // ---- helpers -------------------------------------------------------------------------------

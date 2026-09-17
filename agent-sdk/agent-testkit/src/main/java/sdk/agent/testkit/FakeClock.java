@@ -8,7 +8,7 @@ import java.time.ZoneOffset;
 import java.util.Objects;
 
 /// A [Clock] the test moves by hand. The engine reads the clock at exactly two kinds of place —
-/// every event's `at`, and the wall-clock checkpoints of §4.3.2 — so pinning it makes both
+/// every event timestamp, and the wall-clock checkpoints — so pinning it makes both
 /// deterministic: a wall-clock limit test needs no sleeping and event timestamps are golden-able.
 ///
 /// Reads and writes are `volatile`, because the run drives on another thread than the test.

@@ -18,22 +18,14 @@ import sdk.agent.provider.LlmStream;
 import sdk.agent.provider.LlmStreamEvent;
 
 /// A provider whose whole behaviour is a **script**: a list of [Step]s answered one per
-/// [LlmStream#next]. It is the counterpart of the pure [sdk.agent.turn.TurnMachine] — a hang is a
-/// marker rather than `sleep(3600)`, so the idle-timeout path runs in milliseconds instead of an
-/// hour (kon `mock.py:142`; §4.13.2).
-///
-/// Three fixes to kon's mock are structural here:
-///  1. **Attempt state resets per `stream()` call** — the retry walk is a local variable, so reusing
-///     one provider across runs cannot make `retries()` succeed on attempt 1 of run 2 (kon K-10).
-///  2. **`usage` varies per scenario**, so [#overflowThenStop] can drive a compaction trigger that
-///     kon's constant `Usage(10, 5, 2)` cannot express (kon K-11).
-///  3. **`Hang()` is a marker**, not wall-clock sleep.
+/// [LlmStream#next]. It is the counterpart of the pure [sdk.agent.turn.TurnMachine]: a hang is a
+/// marker rather than a sleep, so the idle-timeout path runs in milliseconds; attempt state resets
+/// per `stream()` call; `usage` varies per scenario.
 ///
 /// A [Step.FailOpen] is a failure of the **open** call: `stream()` throws it, after first burning
-/// up to [#MAX_ATTEMPTS] retryable attempts internally. That keeps retry policy behind the seam
-/// where §4.13 puts it and leaves [LlmStreamEvent.Failed] free to mean *mid-stream* failure — the
-/// two are different code paths in the engine and a test double that conflated them would test one
-/// of them twice.
+/// up to [#MAX_ATTEMPTS] retryable attempts internally. That keeps retry policy behind the seam and
+/// leaves [LlmStreamEvent.Failed] free to mean *mid-stream* failure — the two are different code
+/// paths in the engine.
 public final class ScriptedProvider implements LlmProvider {
 
     /// One instruction of a script.
@@ -72,7 +64,6 @@ public final class ScriptedProvider implements LlmProvider {
     private final AtomicInteger opens = new AtomicInteger();
     private final List<Integer> attempts = new CopyOnWriteArrayList<>();
     private final List<ScriptedStream> streams = new CopyOnWriteArrayList<>();
-    private volatile boolean lastFailureRetryable;
 
     private ScriptedProvider(List<List<Step>> scripts) {
         this.scripts = scripts.stream().map(List::copyOf).toList();
@@ -103,10 +94,9 @@ public final class ScriptedProvider implements LlmProvider {
         List<Step> script = index < scripts.size() ? scripts.get(index) : AFTER_LAST_SCRIPT;
 
         int position = 0;
-        int attempt = 0;                                   // LOCAL: the K-10 fix, structurally
+        int attempt = 0;                                   // per open, so a reused provider cannot carry attempts over
         while (position < script.size() && script.get(position) instanceof Step.FailOpen(var error, var retryable)) {
             attempt++;
-            lastFailureRetryable = retryable;
             if (!retryable || attempt >= MAX_ATTEMPTS) {
                 attempts.add(attempt);
                 throw error;
@@ -118,8 +108,6 @@ public final class ScriptedProvider implements LlmProvider {
         streams.add(stream);
         return stream;
     }
-
-    @Override public boolean shouldRetry(Throwable t) { return lastFailureRetryable; }
 
     // ---- observation -------------------------------------------------------------------------
 
@@ -173,7 +161,7 @@ public final class ScriptedProvider implements LlmProvider {
                 : t.getClass().getSimpleName() + ": " + t.getMessage();
     }
 
-    // ---- Appendix B: the eighteen scenarios ---------------------------------------------------
+    // ---- the eighteen scenarios ---------------------------------------------------------------
 
     /// **1.** Thinking → text → **two** tool calls (`read`, `bash`) → `Done(TOOL_USE)`.
     /// Pins the happy path, parallel calls, content-index keying and the I10 call/result pairing.
@@ -307,7 +295,7 @@ public final class ScriptedProvider implements LlmProvider {
     /// **12. The stale-snapshot trap.** A `write` whose `initialArguments` name `/tmp/stale.txt`,
     /// then a truncated `replace = true` delta, then a hang. Pins that the fallback to
     /// `initialArguments` is **suppressed when the stream stalled** — otherwise the engine writes
-    /// the stale path. The single subtlest rule in the engine (kon `turn.py:145-204`).
+    /// the stale path. The single subtlest rule in the engine.
     public static ScriptedProvider toolHangWithInitialArgs() {
         return of(List.of(
                 emit(new LlmStreamEvent.Start()),
@@ -363,11 +351,11 @@ public final class ScriptedProvider implements LlmProvider {
     }
 
     /// **16.** A normal turn whose `Done` carries usage above a typical `contextWindow - reserved`.
-    /// Drives a compaction trigger — kon's mock cannot express this, its usage is constant.
+    /// Drives a compaction trigger.
     public static ScriptedProvider overflowThenStop() { return of(overflowScript()); }
 
-    /// **17.** Scenario 16, and then the follow-up request (the summary) fails on open. Pins kon
-    /// K-6: a failed compaction must never be reported as a success.
+    /// **17.** Scenario 16, and then the follow-up request (the summary) fails on open. Pins that
+    /// a failed compaction must never be reported as a success.
     public static ScriptedProvider compactionFails() {
         return sequence(List.of(
                 overflowScript(),
@@ -375,7 +363,7 @@ public final class ScriptedProvider implements LlmProvider {
     }
 
     /// **18.** A tool-call delta, then a whole text block, then the **rest** of the same call's
-    /// arguments. Pins kon K-2: a content-block transition must not flush the argument accumulator.
+    /// arguments. Pins that a content-block transition must not flush the argument accumulator.
     public static ScriptedProvider interleavedTextInToolArgs() {
         return of(List.of(
                 emit(new LlmStreamEvent.Start()),

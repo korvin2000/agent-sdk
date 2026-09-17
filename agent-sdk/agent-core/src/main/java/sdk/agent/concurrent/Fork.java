@@ -17,16 +17,13 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 
-/// `StructuredTaskScope`-shaped structured concurrency without preview features. One file, so the
-/// swap when JEP 525 finalises is a single edit. Deliberately smaller than the JDK API: there is no
-/// unbounded `join()` (every wait in an agent has a deadline) and no `isDone()` (it invites a poll
-/// loop where `get()` on a virtual thread is simpler).
+/// Structured concurrency on virtual threads without preview features (`StructuredTaskScope` is
+/// still preview in JDK 26). Deliberately smaller than the JDK API: there is no unbounded `join()`
+/// (every wait in an agent has a deadline) and no `isDone()`.
 ///
-/// [#fork] **rebinds [RunScope#CURRENT]** into the task — the whole reason raw virtual threads are
-/// banned outside this package. [#close] cancels, waits at most the grace period and then
-/// **abandons** what is still running: a task that ignores interrupt leaks one virtual thread by
-/// design, and [Fork#open(Duration, Consumer)] `onLeak` is told its name. A `close()` that could
-/// hang is how a decorative timeout becomes a hang inside our own code.
+/// [#close] cancels, waits at most the grace period and then **abandons** what is still running: a
+/// task that ignores interrupt leaks one virtual thread by design, and `onLeak` is told its name.
+/// A `close()` that could hang is how a decorative timeout becomes a hang inside our own code.
 public final class Fork implements AutoCloseable {
 
     private static final System.Logger LOG = System.getLogger(Fork.class.getName());
@@ -58,16 +55,12 @@ public final class Fork implements AutoCloseable {
 
     public <T> Handle<T> fork(Callable<T> task) { return fork("task-" + names.incrementAndGet(), task); }
 
-    /// The most important six lines in the module: capture the scope at fork time and rebind it
-    /// in the task. `Carrier.call` takes a `ScopedValue.CallableOp`, so `task::call` is required —
-    /// `.call(task)` with a `Callable` variable does not compile.
     public <T> Handle<T> fork(String name, Callable<T> task) {
         Objects.requireNonNull(task, "task");
-        RunScope captured = RunScope.currentIfBound().orElse(null);   // ScopedValue.orElse(null) throws NPE
         var finished = new AtomicBoolean();
         Future<T> future = executor.submit(() -> {
             try {
-                return captured == null ? task.call() : ScopedValue.where(RunScope.CURRENT, captured).call(task::call);
+                return task.call();
             } finally {
                 finished.set(true);
             }

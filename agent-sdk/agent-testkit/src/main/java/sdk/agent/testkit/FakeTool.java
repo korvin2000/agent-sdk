@@ -10,7 +10,7 @@ import java.util.function.UnaryOperator;
 
 import sdk.agent.json.ArgumentException;
 import sdk.agent.json.Json;
-import sdk.agent.json.SchemaValidator;
+import sdk.agent.json.StructuralValidator;
 import sdk.agent.tool.ErrorKind;
 import sdk.agent.tool.ParamCodec;
 import sdk.agent.tool.Tool;
@@ -18,9 +18,9 @@ import sdk.agent.tool.ToolInvocation;
 import sdk.agent.tool.ToolKind;
 import sdk.agent.tool.ToolResult;
 
-/// A configurable [Tool] double: every knob the funnel's ten rows and the batching rule need, and
-/// nothing else. Parameters stay as [Json] — a [ParamCodec#passthrough] by default, or a real
-/// [SchemaValidator#STRUCTURAL] codec via [#validating], which is what produces the byte-exact
+/// A configurable [Tool] double: every knob the funnel and the batching rule need, and nothing
+/// else. Parameters stay as [Json] — a [ParamCodec#passthrough] by default, or the real
+/// [StructuralValidator] via [#validating], which is what produces the byte-exact
 /// `Validation failed for tool "..."` block.
 ///
 /// Concurrency knobs matter as much as the behavioural ones: [#blockingOn] makes a call park on a
@@ -58,7 +58,7 @@ public final class FakeTool implements Tool<Json> {
         return new FakeTool(name).kind(ToolKind.READ_ONLY).answering(answer);
     }
 
-    /// A `MUTATING` tool answering with fixed text — a batch of one, by the rule of §4.3.3.
+    /// A `MUTATING` tool answering with fixed text — always a batch of one.
     public static FakeTool mutating(String name, String answer) {
         return new FakeTool(name).kind(ToolKind.MUTATING).answering(answer);
     }
@@ -126,7 +126,7 @@ public final class FakeTool implements Tool<Json> {
         return new ParamCodec<>() {
             @Override public Json.Obj schema() { return declared; }
             @Override public Json bind(Json arguments) throws ArgumentException {
-                return SchemaValidator.STRUCTURAL.validate(declared, arguments);
+                return StructuralValidator.validate(declared, arguments);
             }
         };
     }

@@ -11,7 +11,6 @@ import sdk.agent.RunDeps;
 import sdk.agent.RunEngine;
 import sdk.agent.RunLimits;
 import sdk.agent.Phase;
-import sdk.agent.RunOptions;
 import sdk.agent.RunResult;
 import sdk.agent.RunState;
 import sdk.agent.Step;
@@ -69,7 +68,7 @@ final class Rig {
 
     RunState initial(String prompt) {
         return RunEngine.start(List.of(UserMessage.text(prompt, clock.instant())), List.of(),
-                new RunOptions(limits, false, registry().hash()), "run-1", clock.instant());
+                limits, registry().hash(), "run-1", clock.instant());
     }
 
     RunEngine engine() { return new RunEngine(new TurnMachine(idleTimeout)); }

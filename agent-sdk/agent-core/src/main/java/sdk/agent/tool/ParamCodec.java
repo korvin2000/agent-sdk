@@ -6,7 +6,7 @@ import sdk.agent.json.ArgumentException;
 import sdk.agent.json.Json;
 import sdk.agent.json.JsonSchema;
 import sdk.agent.json.ParamBinder;
-import sdk.agent.json.SchemaValidator;
+import sdk.agent.json.StructuralValidator;
 
 /// Schema **and** binder in one object. [#ofRecord] derives the schema once and binds through the
 /// exact inverse; [#passthrough] hands opaque arguments to a tool that validates elsewhere (MCP).
@@ -20,16 +20,11 @@ public interface ParamCodec<P> {
     P bind(Json arguments) throws ArgumentException;
 
     static <R extends Record> ParamCodec<R> ofRecord(Class<R> type) {
-        return ofRecord(type, SchemaValidator.STRUCTURAL);
-    }
-
-    static <R extends Record> ParamCodec<R> ofRecord(Class<R> type, SchemaValidator validator) {
-        Objects.requireNonNull(validator, "validator");
         Json.Obj schema = JsonSchema.ofRecord(type);
         return new ParamCodec<>() {
             @Override public Json.Obj schema() { return schema; }
             @Override public R bind(Json arguments) throws ArgumentException {
-                return ParamBinder.bind(type, validator.validate(schema, arguments));
+                return ParamBinder.bind(type, StructuralValidator.validate(schema, arguments));
             }
         };
     }

@@ -51,7 +51,6 @@ class ToolNamingAndSignatureTest {
     void registryIsOrderedFailClosedAndHashed() {
         var registry = ToolRegistry.of(List.of(ToolProvider.of("a", List.of(tool("read"), tool("bash"))), ToolProvider.of("b", List.of(tool("edit")))));
         assertEquals(List.of("read", "bash", "edit"), List.copyOf(registry.names()));
-        assertEquals("b", registry.ownerOf("edit").orElseThrow());
         assertTrue(registry.resolve("nope").isEmpty());
         assertEquals(64, registry.hash().length());
 
@@ -59,10 +58,5 @@ class ToolNamingAndSignatureTest {
                 () -> ToolRegistry.of(List.of(ToolProvider.of("a", List.of(tool("read"))), ToolProvider.of("b", List.of(tool("read"))))));
         assertEquals("a", collision.firstOwner());
         assertEquals("b", collision.secondOwner());
-
-        var replaced = registry.with("b", ToolCatalog.of(List.of(tool("write"))));
-        assertEquals(List.of("read", "bash", "write"), List.copyOf(replaced.names()));
-        assertNotEquals(registry.hash(), replaced.hash());
-        assertEquals(List.of("read", "bash", "edit"), List.copyOf(registry.names()));   // untouched
     }
 }

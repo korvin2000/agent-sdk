@@ -39,7 +39,7 @@ import sdk.agent.tool.ErrorKind;
 import sdk.agent.tool.ToolRegistry;
 import sdk.agent.tool.ToolResult;
 
-/// Composition rules and the `safely` fallbacks of §4.11/§7.9: a throwing hook degrades to its
+/// Composition rules and the `safely` fallbacks: a throwing hook degrades to its
 /// stated fallback — "the rewrite did not apply", never "the tool call vanished".
 @DisplayName("CompositeHooks — composition and isolation")
 final class CompositeHooksTest {

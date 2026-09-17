@@ -8,7 +8,8 @@ import java.util.Optional;
 
 import sdk.agent.json.ArgumentException.Violation;
 
-/// Structural JSON Schema validation: declared `type` per property, `required`, `enum`,
+/// Structural JSON Schema validation (the only validator; an MCP tool binds through
+/// [sdk.agent.tool.ParamCodec#passthrough] because the remote server is the authority): declared `type` per property, `required`, `enum`,
 /// `additionalProperties: false`, and the three bounds `minimum` / `maximum` / `minItems`.
 /// Deliberately **not** implemented: `$ref`, `oneOf`/`anyOf`/`allOf`, `format`, `pattern` — a
 /// false rejection costs the model a whole turn, so precision beats completeness.
@@ -18,9 +19,13 @@ import sdk.agent.json.ArgumentException.Violation;
 /// survive untouched for the error message. Every violation is collected (not just the first) so
 /// the model can fix them all in one reprompt; messages use AJV's wording, which is what the
 /// upstream prompts were tuned against.
-public final class StructuralValidator implements SchemaValidator {
+public final class StructuralValidator {
 
-    @Override public Json validate(Json.Obj schema, Json arguments) throws ArgumentException {
+    private StructuralValidator() { }
+
+    /// Validates `arguments` against `schema` and returns the (possibly type-coerced) value to bind.
+    /// @throws ArgumentException carrying every violation and the raw arguments
+    public static Json validate(Json.Obj schema, Json arguments) throws ArgumentException {
         Json coerced = coerce(schema, arguments);
         var errors = new ArrayList<Violation>();
         check(schema, coerced, Violation.ROOT, errors);

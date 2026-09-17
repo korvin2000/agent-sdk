@@ -12,5 +12,5 @@ dependencies {
 }
 
 // No module-info: the Jackson supplier is located by ServiceLoader and reflects into record
-// constructors, which is exactly the shape JPMS makes brittle (§2.3, §4.14.6).
+// constructors, which is exactly the shape JPMS makes brittle.
 tasks.jar { manifest { attributes("Automatic-Module-Name" to "sdk.agent.mcp") } }

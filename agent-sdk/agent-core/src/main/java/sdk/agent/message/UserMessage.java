@@ -19,11 +19,13 @@ public record UserMessage(List<ContentBlock> content, Instant timestamp) impleme
         return new UserMessage(List.of(new ContentBlock.Text(text, null)), at);
     }
 
-    public static UserMessage of(String text, List<ContentBlock.Image> images) {
+    public static UserMessage of(String text, List<ContentBlock.Image> images) { return of(text, images, Instant.now()); }
+
+    public static UserMessage of(String text, List<ContentBlock.Image> images, Instant at) {
         var blocks = new ArrayList<ContentBlock>(images.size() + 1);
         blocks.add(new ContentBlock.Text(text, null));
         blocks.addAll(images);
-        return new UserMessage(blocks, Instant.now());
+        return new UserMessage(blocks, at);
     }
 
     /// The concatenated text blocks; images and other blocks are skipped.

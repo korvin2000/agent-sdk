@@ -3,7 +3,6 @@ package sdk.agent;
 import java.net.URI;
 import java.time.Duration;
 import java.time.Instant;
-import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -22,8 +21,6 @@ import sdk.agent.message.StopReason;
 import sdk.agent.message.ToolResultMessage;
 import sdk.agent.message.Usage;
 import sdk.agent.message.UserMessage;
-import sdk.agent.turn.ArgAccumulator;
-import sdk.agent.turn.OpenBlock;
 import sdk.agent.turn.TurnPhase;
 import sdk.agent.turn.TurnState;
 
@@ -32,7 +29,13 @@ import sdk.agent.turn.TurnState;
 /// through its registered [AgentMessageCodec]. Encode is **fail-closed** — an unregistered kind
 /// throws naming the class — while decode keeps an unknown kind as an opaque [CustomMessage] so
 /// nothing is ever dropped. `RunOutcome.Failed.cause` does not survive the round trip.
+///
+/// A checkpoint never falls inside a provider stream, so a turn's streaming accumulator (open
+/// block, partial tool-call arguments) is always empty and is not written; `content` is the
+/// finished assistant message's content.
 public final class RunStateCodec {
+
+    public static final int SCHEMA_VERSION = 2;
 
     private final Map<String, AgentMessageCodec> custom;
 
@@ -44,12 +47,12 @@ public final class RunStateCodec {
 
     public Json encode(RunState s) {
         var m = new LinkedHashMap<String, Json>();
-        m.put("schemaVersion", Json.num(s.schemaVersion()));
+        m.put("schemaVersion", Json.num(SCHEMA_VERSION));
         m.put("runId", Json.str(s.runId()));
         m.put("phase", Json.str(s.phase().name()));
         m.put("turnIndex", Json.num(s.turnIndex()));
         m.put("transcript", messages(s.transcript()));
-        m.put("produced", messages(s.produced()));
+        m.put("seedSize", Json.num(s.seedSize()));
         m.put("pendingInjection", messages(s.pendingInjection()));
         m.put("turn", s.turn() == null ? Json.nil() : encode(s.turn()));
         m.put("limits", encode(s.limits()));
@@ -57,7 +60,6 @@ public final class RunStateCodec {
         m.put("toolCallsUsed", Json.num(s.toolCallsUsed()));
         m.put("usage", encode(s.usage()));
         m.put("startedAt", Json.str(s.startedAt().toString()));
-        m.put("skipInitialSteeringPoll", Json.bool(s.skipInitialSteeringPoll()));
         m.put("outcome", s.outcome() == null ? Json.nil() : encode(s.outcome()));
         m.put("toolSetHash", s.toolSetHash() == null ? Json.nil() : Json.str(s.toolSetHash()));
         return Json.obj(m);
@@ -66,15 +68,15 @@ public final class RunStateCodec {
     public RunState decode(Json json) {
         Json.Obj o = obj(json, "run state");
         int version = num(o, "schemaVersion").asInt();
-        if (version != RunState.SCHEMA_VERSION) {
-            throw new IllegalArgumentException("unsupported RunState schema version " + version + " (this SDK writes " + RunState.SCHEMA_VERSION + ")");
+        if (version != SCHEMA_VERSION) {
+            throw new IllegalArgumentException("unsupported RunState schema version " + version + " (this SDK writes " + SCHEMA_VERSION + ")");
         }
         return new RunState(
                 str(o, "runId"),
                 Phase.valueOf(str(o, "phase")),
                 num(o, "turnIndex").asInt(),
                 messages(arr(o, "transcript")),
-                messages(arr(o, "produced")),
+                num(o, "seedSize").asInt(),
                 messages(arr(o, "pendingInjection")),
                 nullable(o, "turn", this::decodeTurn),
                 decodeLimits(obj(o.get("limits").orElseThrow(), "limits")),
@@ -82,9 +84,7 @@ public final class RunStateCodec {
                 num(o, "toolCallsUsed").asInt(),
                 decodeUsage(obj(o.get("usage").orElseThrow(), "usage")),
                 Instant.parse(str(o, "startedAt")),
-                bool(o, "skipInitialSteeringPoll"),
                 nullable(o, "outcome", this::decodeOutcome),
-                version,
                 optStr(o, "toolSetHash"));
     }
 
@@ -198,20 +198,6 @@ public final class RunStateCodec {
         m.put("index", Json.num(t.index()));
         m.put("phase", Json.str(t.phase().name()));
         m.put("model", encode(t.model()));
-        m.put("content", blocks(t.content()));
-        m.put("openBlock", t.openBlock().<Json>map(this::encode).orElse(Json.Null.NULL));
-        var active = new ArrayList<Json>();
-        t.activeCalls().forEach((index, acc) -> {
-            var a = new LinkedHashMap<String, Json>();
-            a.put("index", Json.num(index));
-            a.put("toolCallId", Json.str(acc.toolCallId()));
-            a.put("toolName", Json.str(acc.toolName()));
-            a.put("fragments", Json.str(acc.fragments()));
-            a.put("initialArguments", acc.initialArguments() == null ? Json.nil() : acc.initialArguments());
-            putIfPresent(a, "thoughtSignature", acc.thoughtSignature());
-            active.add(Json.obj(a));
-        });
-        m.put("activeCalls", Json.arr(active));
         var preflight = new LinkedHashMap<String, Json>();
         t.preflight().forEach((id, text) -> preflight.put(id, Json.str(text)));
         m.put("preflight", Json.obj(preflight));
@@ -223,36 +209,16 @@ public final class RunStateCodec {
 
     private TurnState decodeTurn(Json json) {
         Json.Obj o = obj(json, "turn state");
-        var active = new LinkedHashMap<Integer, ArgAccumulator>();
-        for (Json j : arr(o, "activeCalls").values()) {
-            Json.Obj a = obj(j, "active call");
-            Json initial = a.get("initialArguments").filter(v -> v != Json.Null.NULL).orElse(null);
-            active.put(num(a, "index").asInt(), new ArgAccumulator(str(a, "toolCallId"), str(a, "toolName"), str(a, "fragments"), initial, optStr(a, "thoughtSignature")));
-        }
         var preflight = new LinkedHashMap<String, String>();
         obj(o.get("preflight").orElse(Json.Obj.EMPTY), "preflight").members().forEach((k, v) -> preflight.put(k, ((Json.Str) v).value()));
+        AssistantMessage assistant = nullable(o, "assistant", j -> (AssistantMessage) decodeMessage(j));
         List<Optional<ToolResultMessage>> slots = arr(o, "slots").values().stream()
                 .map(s -> s == Json.Null.NULL ? Optional.<ToolResultMessage>empty() : Optional.of((ToolResultMessage) decodeMessage(s)))
                 .toList();
         return new TurnState(str(o, "runId"), num(o, "index").asInt(), TurnPhase.valueOf(str(o, "phase")),
-                decodeModel(obj(o.get("model").orElseThrow(), "model")), decodeBlocks(arr(o, "content")),
-                Optional.ofNullable(nullable(o, "openBlock", this::decodeOpenBlock)), active, preflight,
-                nullable(o, "assistant", j -> (AssistantMessage) decodeMessage(j)), slots, bool(o, "stalled"));
-    }
-
-    private Json encode(OpenBlock b) {
-        var m = new LinkedHashMap<String, Json>();
-        m.put("kind", Json.str(b.kind().name()));
-        m.put("index", Json.num(b.index()));
-        m.put("text", Json.str(b.text()));
-        putIfPresent(m, "signature", b.signature());
-        m.put("redacted", Json.bool(b.redacted()));
-        return Json.obj(m);
-    }
-
-    private OpenBlock decodeOpenBlock(Json json) {
-        Json.Obj o = obj(json, "open block");
-        return new OpenBlock(OpenBlock.Kind.valueOf(str(o, "kind")), num(o, "index").asInt(), str(o, "text"), optStr(o, "signature"), bool(o, "redacted"));
+                decodeModel(obj(o.get("model").orElseThrow(), "model")),
+                assistant == null ? List.of() : assistant.content(), Optional.empty(), new LinkedHashMap<>(),
+                preflight, assistant, slots, bool(o, "stalled"));
     }
 
     // ---- small records -------------------------------------------------------------------------

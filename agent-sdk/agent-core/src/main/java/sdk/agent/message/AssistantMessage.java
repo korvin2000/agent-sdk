@@ -22,7 +22,7 @@ public record AssistantMessage(List<ContentBlock> content,
         Objects.requireNonNull(timestamp, "timestamp");
     }
 
-    /// Computed once here rather than at every consumer (pi recomputes it at `agent-loop.ts:201` and `:343`).
+    /// Computed once here rather than at every consumer.
     public List<ContentBlock.ToolCall> toolCalls() {
         return content.stream()
                 .filter(ContentBlock.ToolCall.class::isInstance)
@@ -33,10 +33,6 @@ public record AssistantMessage(List<ContentBlock> content,
     public String text() { return ContentBlock.textOf(content); }
 
     public boolean terminal() { return stopReason == StopReason.ERROR || stopReason == StopReason.ABORTED; }
-
-    public static AssistantMessage failed(ModelRef model, StopReason reason, String message, Instant at) {
-        return new AssistantMessage(List.of(), model, null, Usage.EMPTY, reason, message, at);
-    }
 
     @Override public String kind() { return "assistant"; }
 }

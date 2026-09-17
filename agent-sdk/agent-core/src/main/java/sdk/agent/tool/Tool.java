@@ -24,9 +24,6 @@ public interface Tool<P> {
 
     ToolResult execute(ToolInvocation<P> call) throws Exception;
 
-    /// Host-facing only.
-    default String label() { return name(); }
-
     /// Fail-safe default: forgetting to declare `READ_ONLY` costs concurrency, not correctness.
     default ToolKind kind() { return ToolKind.MUTATING; }
 

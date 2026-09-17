@@ -35,7 +35,7 @@ import sdk.agent.message.UserMessage;
 import sdk.agent.tool.ToolMessages;
 import sdk.agent.tool.ToolResult;
 
-/// Phase 7 of §5: the §4.3.2 table driven with a [ScriptedProvider] and [FakeTool]s, asserting
+/// The engine phase table driven with a [ScriptedProvider] and [FakeTool]s, asserting
 /// **pi's documented event trace with the two documented deviations** (prompt messages before the
 /// first `TurnStart`; tool results in assistant source order) plus [RecordingSink#assertInvariants].
 @Timeout(value = 20, unit = TimeUnit.SECONDS)
@@ -106,7 +106,7 @@ final class RunEngineTraceTest {
     }
 
     @Test
-    @DisplayName("a MUTATING call is a batch of one: §4.3.3 partitions in source order")
+    @DisplayName("a MUTATING call is a batch of one: batches partition in source order")
     void mutatingAndReadOnlyMixAreSeparateBatches() {
         var read = FakeTool.mutating("read", "contents");        // MUTATING first -> singleton batch
         var bash = FakeTool.readOnly("bash", "total 0");
@@ -437,7 +437,7 @@ final class RunEngineTraceTest {
         var turnEnd = rig.sink.ofType(AgentEvent.TurnEnd.class).getFirst();
         assertEquals(1, turnEnd.message().toolCalls().size());
         assertTrue(turnEnd.toolResults().isEmpty(),
-                "I10 is about a turn that RAN tools; §4.3.2's Stop/Retry rows emit TurnEnd(assistant, [])");
+                "I10 is about a turn that RAN tools; the Stop/Retry rows emit TurnEnd(assistant, [])");
         assertTrue(((UserMessage) result.produced().get(2)).text()
                 .startsWith("Your previous response contained a malformed tool call."));
     }
@@ -483,7 +483,7 @@ final class RunEngineTraceTest {
     // ---- a defect the invariants catch ------------------------------------------------------------
 
     @Test
-    @DisplayName("a provider whose next() throws still finalises the turn, as §4.3.8(6) requires on every path")
+    @DisplayName("a provider whose next() throws still finalises the turn on every path")
     void providerNextThrowingKeepsTheInvariants() {
         LlmProvider exploding = (request, cancel) -> new sdk.agent.provider.LlmStream() {
             private int emitted;

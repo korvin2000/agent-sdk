@@ -10,7 +10,7 @@ import sdk.agent.spi.Extension;
 /// module from the classpath and the host loses one `.extension(...)` line: no core type, no
 /// prompt section and no tool interface changes shape. Note what is *not* contributed — no hook,
 /// no message codec, no prompt contributor: remote tools describe themselves through
-/// `Tool.description()` like every other tool, so `## AVAILABLE TOOLS` picks them up with no
+/// `Tool.description()` like every other tool, so the tool schema carries them with no
 /// MCP-specific rendering.
 ///
 /// ## Verified against mcp-core 2.0.1 — the eleven flagged facts
@@ -25,7 +25,7 @@ import sdk.agent.spi.Extension;
 ///    until EOF and emitting each line into `errorSink`. `setStdErrorHandler(Consumer<String>)`
 ///    and `getErrorSink()` are public. The pipe cannot fill and block the child.
 /// 2. **`McpSchema.Content` is NOT sealed**, so the `default` arm in [McpContentMapper] is
-///    present, exactly as §4.14.4 prints it. Declared `public interface McpSchema$Content extends
+///    present. Declared `public interface McpSchema$Content extends
 ///    McpSchema$Meta` with a `default String type()` and no `permits`. Implementations found:
 ///    `TextContent`, `ImageContent`, `AudioContent`, `EmbeddedResource`, `ResourceLink` — the
 ///    spec's case list is complete for this release. `EmbeddedResource.resource()` is an
@@ -66,7 +66,7 @@ import sdk.agent.spi.Extension;
 ///    tools/list_changed, elicitation/complete}`. The design is `requestTimeout` + interrupt, as
 ///    assumed. `tools/list_changed` **is** supported and is surfaced as
 ///    `McpClient.SyncSpec.toolsChangeConsumer(Consumer<List<McpSchema.Tool>>)`, which is what
-///    drives [McpToolProvider#catalogUpdates].
+///    republishes the [McpToolProvider] tool list.
 /// 9. **Gradle 9.7.1 resolves and compiles this module on the JDK 26 toolchain** — the same
 ///    `sdk.java-conventions` toolchain, `--release 26` and `-Werror` as every other module, with
 ///    mcp-core's Java 17 baseline causing no conflict.

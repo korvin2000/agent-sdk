@@ -13,12 +13,12 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import sdk.agent.concurrent.Fork;
-import sdk.agent.tool.ToolCatalog;
+import sdk.agent.tool.Tool;
 
 /// Every connection this module owns. Connects in parallel, fault-isolated, and reports in
 /// **declaration order** rather than completion order.
 ///
-/// **Atomic registration**: a server appears in the catalog only after `initialize()` *and*
+/// **Atomic registration**: a server appears in the tool list only after `initialize()` *and*
 /// `tools/list` have both succeeded. A half-connected server is closed by [McpConnection#open] and
 /// never registered, so a handshake-ok/list-failed stdio server cannot leak its child process.
 final class McpConnectionPool implements AutoCloseable {
@@ -64,17 +64,17 @@ final class McpConnectionPool implements AutoCloseable {
         return pool;
     }
 
-    ToolCatalog catalog() { return provider.catalog(); }
+    List<Tool<?>> tools() { return provider.tools(); }
 
     McpToolProvider provider() { return provider; }
 
     List<McpInitResult> results() { return results; }
 
-    /// Rebuilds the namespaced catalog from every registered connection and publishes a **new**
+    /// Rebuilds the namespaced tool list from every registered connection and publishes a **new**
     /// immutable snapshot; the previous one is never mutated.
     private void republish(boolean strict) {
         if (closed.get()) {
-            provider.publish(ToolCatalog.EMPTY);
+            provider.publish(List.of());
             return;
         }
         var adapters = new ArrayList<McpToolAdapter>();
@@ -83,7 +83,7 @@ final class McpConnectionPool implements AutoCloseable {
     }
 
     /// Resilient disconnect, in reverse connect order: every client closed in its own try/catch, a
-    /// tally logged, and the catalog emptied so no stale tool survives the teardown.
+    /// tally logged, and the tool list emptied so no stale tool survives the teardown.
     void closeAll() {
         if (!closed.compareAndSet(false, true)) return;
         var names = new ArrayList<>(connections.sequencedKeySet());
@@ -97,8 +97,7 @@ final class McpConnectionPool implements AutoCloseable {
                 LOG.log(System.Logger.Level.WARNING, "closing MCP server " + server + " threw", e);
             }
         }
-        provider.publish(ToolCatalog.EMPTY);
-        provider.close();
+        provider.publish(List.of());
         LOG.log(System.Logger.Level.DEBUG, "closed {0} of {1} MCP connections", done, names.size());
     }
 

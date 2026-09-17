@@ -11,7 +11,6 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Supplier;
 
-import sdk.agent.concurrent.RunScope;
 import sdk.agent.event.AgentEvent;
 import sdk.agent.event.RunOutcome;
 import sdk.agent.hook.TurnContext;
@@ -35,12 +34,12 @@ import sdk.agent.turn.TurnMachine;
 import sdk.agent.turn.TurnPhase;
 import sdk.agent.turn.TurnState;
 
-/// Layer 2: owns the I/O, satisfies every [Need] of the pure [TurnMachine], and returns only at
+/// The driver: owns the I/O, satisfies every [Need] of the pure [TurnMachine], and returns only at
 /// durable checkpoints. One `advance()` performs exactly one row of the phase table:
 ///
 /// | from | work | to |
 /// |---|---|---|
-/// | `NEW` | `RunStart`; append prompts (+ steering unless skipped) | `TURN_OPENING` |
+/// | `NEW` | `RunStart`; append prompts and queued steering | `TURN_OPENING` |
 /// | `TURN_OPENING` | ck1; `beforeTurn`; inject; ck2; transform → convert → request → `beforeRequest`; stream to a terminal event | `ASSISTANT_READY` |
 /// | `ASSISTANT_READY` | `afterAssistant` verdict | `FINISHED` / `TURN_OPENING` / `TOOLS_RUNNING` / `TURN_CLOSED` |
 /// | `TOOLS_RUNNING` | ck3; tool cap; one batch through the funnel | `TOOLS_RUNNING` or `TURN_CLOSED` |
@@ -62,19 +61,18 @@ public final class RunEngine {
 
     public RunEngine(TurnMachine machine) { this.machine = Objects.requireNonNull(machine, "machine"); }
 
-    public static RunState start(List<AgentMessage> prompts, List<AgentMessage> seed, RunOptions options, String runId, Instant now) {
-        Objects.requireNonNull(options, "options");
-        return new RunState(runId, Phase.NEW, 0, seed, List.of(), prompts, null, options.limits(), 0, 0, null, now,
-                options.skipInitialSteeringPoll(), null, RunState.SCHEMA_VERSION, options.toolSetHash());
+    /// The initial state: `seed` is the transcript inherited from earlier runs, `prompts` are appended first.
+    public static RunState start(List<AgentMessage> prompts, List<AgentMessage> seed, RunLimits limits,
+                                 String toolSetHash, String runId, Instant now) {
+        return new RunState(runId, Phase.NEW, 0, seed, seed.size(), prompts, null, limits, 0, 0, null, now, null, toolSetHash);
     }
 
-    /// Performs exactly one row. Binds [RunScope#CURRENT] for the duration, so tools may read it.
+    /// Performs exactly one row.
     public Step advance(RunState s, RunDeps d) {
         Objects.requireNonNull(s, "state");
         Objects.requireNonNull(d, "deps");
-        var scope = new RunScope(s.runId(), s.turnIndex(), d.cancel());
         try {
-            return ScopedValue.where(RunScope.CURRENT, scope).call(() -> row(s, d));
+            return row(s, d);
         } catch (Throwable t) {
             emitRunEnd(s, new RunOutcome.Failed(StopReason.ERROR, ToolFunnel.describe(t), t), d);
             throw t;
@@ -107,7 +105,7 @@ public final class RunEngine {
         emit(new AgentEvent.RunStart(s.runId(), AgentEvent.RUN_SCOPED, now(d)), d);
         var inject = new ArrayList<>(s.pendingInjection());
         b.pendingInjection.clear();
-        if (!s.skipInitialSteeringPoll()) inject.addAll(d.steering().get());
+        inject.addAll(d.steering().get());
         for (AgentMessage m : inject) emitAndAppend(b, m, AgentEvent.RUN_SCOPED, d);
         b.phase = Phase.TURN_OPENING;
         return new Step.Continue(b.build());
@@ -324,7 +322,7 @@ public final class RunEngine {
 
     // ---- events ------------------------------------------------------------------------------
 
-    /// I2: idempotent by construction, so the `FINISHED` row and the catch in `advance` cannot both fire.
+    /// Idempotent by construction, so the `FINISHED` row and the catch in `advance` cannot both fire.
     private void emitRunEnd(RunState s, RunOutcome outcome, RunDeps d) {
         if (!runEndEmitted.compareAndSet(false, true)) return;
         emit(new AgentEvent.RunEnd(s.runId(), AgentEvent.RUN_SCOPED, now(d), s.produced(), outcome), d);
@@ -341,10 +339,7 @@ public final class RunEngine {
     private void apply(RunState.Builder b, List<AgentEvent> events, RunDeps d) {
         for (AgentEvent e : events) {
             emit(e, d);
-            if (e instanceof AgentEvent.MessageEnd(_, _, _, var message)) {
-                b.transcript.add(message);
-                b.produced.add(message);
-            }
+            if (e instanceof AgentEvent.MessageEnd(_, _, _, var message)) b.transcript.add(message);
         }
     }
 

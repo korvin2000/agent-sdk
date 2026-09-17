@@ -11,10 +11,8 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
-import java.util.stream.Stream;
 
 import sdk.agent.concurrent.Cancellation;
-import sdk.agent.event.AgentEvent;
 import sdk.agent.event.AgentListener;
 import sdk.agent.event.EventSink;
 import sdk.agent.event.ListenerFanout;
@@ -35,22 +33,22 @@ import sdk.agent.prompt.SystemPromptOverride;
 import sdk.agent.provider.LlmProvider;
 import sdk.agent.provider.LlmRequest;
 import sdk.agent.spi.Extension;
+import sdk.agent.tool.ToolProvider;
 import sdk.agent.tool.ToolRegistry;
 import sdk.agent.turn.TurnMachine;
 
 /// The facade. Owns at most one live run, the two message queues, the listener fan-out and the
-/// transcript between runs. Four deliberate divergences from pi-mono: `abort()` clears both
-/// queues; `reset()` aborts and waits first; listener throws are isolated; late events never throw.
+/// transcript between runs. `abort()` clears both queues; `reset()` aborts and waits first;
+/// listener throws are isolated; late events never throw.
 public final class Agent implements AutoCloseable {
 
     /// Everything the builder decided, immutable.
     record Config(LlmProvider provider,
-                  ToolRegistry tools,
+                  List<ToolProvider> toolProviders,
                   AgentHooks hooks,
                   MessageConverter converter,
                   Map<String, AgentMessageCodec> codecs,
                   List<SectionSpec> sections,
-                  PromptContext promptContext,
                   Optional<SystemPromptOverride> promptOverride,
                   LlmRequest requestTemplate,
                   RunLimits limits,
@@ -64,9 +62,6 @@ public final class Agent implements AutoCloseable {
     private final ListenerFanout fanout;
     private final MessageQueue steering = new MessageQueue();
     private final MessageQueue followUps = new MessageQueue();
-    private final List<QueueSink> agentQueues = new java.util.ArrayList<>();
-    // A per-task virtual-thread executor rather than a raw Thread: the driver binds RunScope itself
-    // on every advance(), so nothing here depends on ScopedValue inheritance (C10).
     private final ExecutorService runner = Executors.newVirtualThreadPerTaskExecutor();
     private final Object lock = new Object();
 
@@ -85,48 +80,50 @@ public final class Agent implements AutoCloseable {
     // ---- running -------------------------------------------------------------------------------
 
     /// @throws IllegalStateException if a run is active
-    public AgentRun prompt(List<AgentMessage> messages) { return start(List.copyOf(messages), false); }
+    public AgentRun prompt(List<AgentMessage> messages) { return start(List.copyOf(messages)); }
 
     public AgentRun prompt(String text) { return prompt(List.of(UserMessage.text(text, cfg.clock().instant()))); }
 
-    public AgentRun prompt(String text, List<ContentBlock.Image> images) { return prompt(List.of(UserMessage.of(text, images))); }
+    public AgentRun prompt(String text, List<ContentBlock.Image> images) {
+        return prompt(List.of(UserMessage.of(text, images, cfg.clock().instant())));
+    }
 
     /// Another turn from the current transcript; steering messages, if any, are used.
-    public AgentRun resume() { return start(List.of(), false); }
+    public AgentRun resume() { return start(List.of()); }
 
     /// Resume a checkpointed run (`AgentRun.state()`, persisted through [#codec]) with this agent's
     /// collaborators. Refused, naming the reason, if the run is finished or the tool set changed.
     public AgentRun resume(RunState persisted) {
         Objects.requireNonNull(persisted, "persisted");
         if (persisted.finished()) throw new IllegalStateException("run " + persisted.runId() + " is already finished");
-        if (persisted.toolSetHash() != null && !persisted.toolSetHash().equals(cfg.tools().hash())) {
+        ToolRegistry tools = tools();
+        if (persisted.toolSetHash() != null && !persisted.toolSetHash().equals(tools.hash())) {
             throw new IllegalStateException("tool set changed since run " + persisted.runId() + " was checkpointed: "
-                    + persisted.toolSetHash() + " vs " + cfg.tools().hash());
+                    + persisted.toolSetHash() + " vs " + tools.hash());
         }
-        return launch(persisted);
+        return launch(persisted, tools);
     }
 
     /// The codec for persisting [AgentRun#state], aware of every registered custom message kind.
     public RunStateCodec codec() { return new RunStateCodec(cfg.codecs()); }
 
-    private AgentRun start(List<AgentMessage> prompts, boolean skipInitialSteeringPoll) {
+    private AgentRun start(List<AgentMessage> prompts) {
         synchronized (lock) {
+            ToolRegistry tools = tools();
             String runId = UUID.randomUUID().toString();
-            return launch(RunEngine.start(prompts, transcript,
-                    new RunOptions(cfg.limits(), skipInitialSteeringPoll, cfg.tools().hash()), runId, cfg.clock().instant()));
+            return launch(RunEngine.start(prompts, transcript, cfg.limits(), tools.hash(), runId, cfg.clock().instant()), tools);
         }
     }
 
-    private AgentRun launch(RunState initial) {
+    private AgentRun launch(RunState initial, ToolRegistry tools) {
         synchronized (lock) {
             if (active != null) throw new IllegalStateException("a run is already active: " + active.runId());
-            String runId = initial.runId();
             var cancel = Cancellation.create();
             var queue = new QueueSink();
-            EventSink sink = EventSink.tee(List.of(fanout, queue, agentLevelQueues()));
-            RunDeps deps = new RunDeps(cfg.provider(), cfg.tools(), cfg.hooks(), cfg.converter(), sink, cancel,
-                    steering::drain, followUps::drain, cfg.requestTemplate().withSystemPrompt(systemPrompt()), cfg.clock());
-            var run = new AgentRun(runId, cancel, queue, initial);
+            EventSink sink = EventSink.tee(List.of(fanout, queue));
+            RunDeps deps = new RunDeps(cfg.provider(), tools, cfg.hooks(), cfg.converter(), sink, cancel,
+                    steering::drain, followUps::drain, cfg.requestTemplate().withSystemPrompt(systemPrompt(tools)), cfg.clock());
+            var run = new AgentRun(initial.runId(), cancel, queue, initial);
             active = run;
             last = run;
             idle = new CompletableFuture<>();
@@ -149,7 +146,6 @@ public final class Agent implements AutoCloseable {
             }
         } catch (Throwable t) {
             LOG.log(System.Logger.Level.ERROR, "run " + run.runId() + " failed", t);
-            sink.fail(t);
             result = new RunResult(state, new RunOutcome.Failed(StopReason.ERROR, ToolFunnel.describe(t), t));
         } finally {
             sink.close();                                                   // non-negotiable
@@ -164,28 +160,11 @@ public final class Agent implements AutoCloseable {
         wasIdle.complete(null);
     }
 
-    /// The agent-level pull streams outlive runs: a run's `close()` must not end them.
-    private EventSink agentLevelQueues() {
-        return new EventSink() {
-            @Override public void emit(AgentEvent event) { snapshot().forEach(q -> q.emit(event)); }
-            @Override public void fail(Throwable cause)  { snapshot().forEach(q -> q.fail(cause)); }
-            @Override public void close()                { }
-            private List<QueueSink> snapshot() { synchronized (lock) { return List.copyOf(agentQueues); } }
-        };
-    }
-
     // ---- observation ---------------------------------------------------------------------------
 
-    /// Ordered, sequential, isolated fan-out; the subscription outlives runs.
+    /// Ordered, sequential, isolated fan-out; the subscription outlives runs. For a pull stream of
+    /// one run use [AgentRun#events].
     public Subscription subscribe(AgentListener listener) { return fanout.subscribe(listener); }
-
-    /// A one-shot, single-consumer, blocking stream over every event of every future run, until
-    /// the stream is closed. Prefer [AgentRun#events] for one run.
-    public Stream<AgentEvent> events() {
-        var queue = new QueueSink();
-        synchronized (lock) { agentQueues.add(queue); }
-        return queue.stream().onClose(() -> { synchronized (lock) { agentQueues.remove(queue); } });
-    }
 
     public AgentSnapshot state() {
         synchronized (lock) {
@@ -201,10 +180,15 @@ public final class Agent implements AutoCloseable {
         synchronized (lock) { return active != null ? active.state().transcript() : transcript; }
     }
 
-    public ToolRegistry tools() { return cfg.tools(); }
+    /// The tools as they would be registered for a run started now (a dynamic provider may have changed).
+    public ToolRegistry tools() { return ToolRegistry.of(cfg.toolProviders()); }
 
     /// The system prompt as it would be sent now (volatile sections render at call time).
-    public String systemPrompt() { return SystemPromptBuilder.build(cfg.promptContext(), cfg.sections(), cfg.promptOverride()); }
+    public String systemPrompt() { return systemPrompt(tools()); }
+
+    private String systemPrompt(ToolRegistry tools) {
+        return SystemPromptBuilder.build(new PromptContext(tools.tools()), cfg.sections(), cfg.promptOverride());
+    }
 
     // ---- control -------------------------------------------------------------------------------
 
@@ -212,7 +196,7 @@ public final class Agent implements AutoCloseable {
 
     public void followUp(AgentMessage message) { followUps.push(message); }
 
-    /// Returns immediately; [#waitForIdle] is how you learn it stopped. Also clears both queues.
+    /// Returns without waiting; [#waitForIdle] is how you learn it stopped. Also clears both queues.
     public void abort() {
         AgentRun run;
         synchronized (lock) { run = active; }
@@ -244,9 +228,6 @@ public final class Agent implements AutoCloseable {
         for (Extension e : cfg.extensions().reversed()) {
             try { e.close(); } catch (Exception ex) { LOG.log(System.Logger.Level.WARNING, "extension " + e.id() + " close threw", ex); }
         }
-        List<QueueSink> queues;
-        synchronized (lock) { queues = List.copyOf(agentQueues); agentQueues.clear(); }
-        queues.forEach(QueueSink::close);
         runner.shutdownNow();
     }
 }

@@ -21,7 +21,6 @@ import sdk.agent.json.Json;
 import sdk.agent.message.AgentMessageCodec;
 import sdk.agent.message.MessageConverter;
 import sdk.agent.message.ModelRef;
-import sdk.agent.prompt.PromptContext;
 import sdk.agent.prompt.PromptContributor;
 import sdk.agent.prompt.SectionSpec;
 import sdk.agent.prompt.SystemPromptBuilder;
@@ -37,8 +36,8 @@ import sdk.agent.tool.ToolRegistry;
 import sdk.agent.turn.TurnMachine;
 
 /// Assembles an [Agent] from a provider and extensions. `contributions()` is called exactly once
-/// per extension, in registration order; the registry, the section list and the codec map are
-/// validated here — fail-closed, naming both owners on any collision.
+/// per extension, in registration order; tool names, section ids and message codecs are validated
+/// here — fail-closed, naming both owners on any collision.
 public final class AgentBuilder {
 
     private static final System.Logger LOG = System.getLogger(AgentBuilder.class.getName());
@@ -115,21 +114,19 @@ public final class AgentBuilder {
             c.provider().ifPresent(contributedProviders::add);
         }
 
-        ToolRegistry registry = ToolRegistry.of(providers);                         // fail-closed on collisions
+        ToolRegistry.of(providers);                                                 // fail-closed on collisions, now
         SystemPromptBuilder.validate(sectionsByContributor);                        // unique section ids
         List<SectionSpec> sections = sectionsByContributor.values().stream().flatMap(List::stream).toList();
-
-        LlmProvider llm = chooseProvider(contributedProviders);
 
         var allHooks = new ArrayList<AgentHooks>();
         if (turnGuard != null) allHooks.add(turnGuard);
         allHooks.addAll(hooks);
         allHooks.addAll(contributedHooks);
 
-        var promptContext = new PromptContext(registry.tools());
         var template = new LlmRequest(model, "", List.of(), List.of(), thinking, maxOutputTokens, providerOptions);
-        var config = new Agent.Config(llm, registry, new CompositeHooks(allHooks, onHookError), converter, Map.copyOf(codecs),
-                sections, promptContext, Optional.ofNullable(promptOverride), template, limits, clock, toolIdleTimeout, List.copyOf(all));
+        var config = new Agent.Config(chooseProvider(contributedProviders), List.copyOf(providers),
+                new CompositeHooks(allHooks, onHookError), converter, Map.copyOf(codecs), sections,
+                Optional.ofNullable(promptOverride), template, limits, clock, toolIdleTimeout, List.copyOf(all));
         return new Agent(config, new ListenerFanout(onListenerError));
     }
 

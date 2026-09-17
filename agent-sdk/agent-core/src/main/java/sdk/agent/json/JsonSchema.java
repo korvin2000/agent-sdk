@@ -84,12 +84,7 @@ public final class JsonSchema {
         Json.Obj schema = schemaFor(inner, where);
 
         Doc doc = c.getAnnotation(Doc.class);
-        if (doc != null) {
-            schema = schema.with("description", Json.str(doc.value()));
-            if (doc.examples().length > 0) {
-                schema = schema.with("examples", Json.arr(List.of(doc.examples()).stream().map(Json::str).toList()));
-            }
-        }
+        if (doc != null) schema = schema.with("description", Json.str(doc.value()));
         Constraint constraint = c.getAnnotation(Constraint.class);
         if (constraint != null) schema = applyConstraint(schema, constraint, where);
         return schema;

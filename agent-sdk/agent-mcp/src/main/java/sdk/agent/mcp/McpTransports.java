@@ -63,7 +63,7 @@ final class McpTransports {
         return builder.build();
     }
 
-    /// `ServerParameters` carries no working directory (§4.14.10 item 4). `getProcessBuilder()` is
+    /// `ServerParameters` carries no working directory. `getProcessBuilder()` is
     /// `protected`, and `StdioClientTransport.connect()` only calls `command(...)`,
     /// `environment().putAll(...)` and `start()` on what it returns — it never touches
     /// `directory(...)` — so overriding it is the supported way to supply one. That beats the

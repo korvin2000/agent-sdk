@@ -1,7 +1,6 @@
 package sdk.agent.concurrent;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -29,36 +28,17 @@ class ConcurrencyPrimitivesTest {
         assertEquals(List.of("a", "b"), order);
         c.onCancel(() -> order.add("late"));
         assertEquals(List.of("a", "b", "late"), order);
-        assertThrows(CancelledException.class, c::throwIfCancelled);
+        assertTrue(c.isCancelled());
     }
 
     @Test
-    void registrationCloseDeregistersAndLinkIsOneWay() {
-        var parent = Cancellation.create();
-        var child = Cancellation.linkedTo(parent);
+    void registrationCloseDeregisters() {
+        var c = Cancellation.create();
         var count = new AtomicInteger();
-        Cancellation.Registration reg = child.onCancel(count::incrementAndGet);
+        Cancellation.Registration reg = c.onCancel(count::incrementAndGet);
         reg.close();
-        child.cancel();
+        c.cancel();
         assertEquals(0, count.get());
-        assertFalse(parent.isCancelled());
-
-        var child2 = Cancellation.linkedTo(parent);
-        parent.cancel();
-        assertTrue(child2.isCancelled());
-    }
-
-    @Test
-    void forkRebindsRunScopeAndRunScopeThrowsWhenUnbound() throws Exception {
-        assertThrows(IllegalStateException.class, RunScope::current);
-        var scope = new RunScope("run-1", 3, Cancellation.create());
-        String seen = scope.call(() -> {
-            try (var fork = Fork.open()) {
-                return fork.fork(() -> RunScope.current().runId() + "/" + RunScope.current().turnIndex()).get();
-            }
-        });
-        assertEquals("run-1/3", seen);
-        assertTrue(RunScope.currentIfBound().isEmpty());
     }
 
     @Test

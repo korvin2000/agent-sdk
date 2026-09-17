@@ -12,15 +12,10 @@ import java.util.stream.Stream;
 import java.util.stream.StreamSupport;
 
 /// Pull side: a bounded blocking queue with a poison sentinel, driving a one-shot, single-consumer
-/// `Stream<AgentEvent>`. Bounded and backpressured (the producer blocks when the consumer is slow);
-/// an abandoned stream (closed by its consumer) stops the producer blocking; a late emit after
-/// close is counted and dropped, never thrown.
+/// `Stream<AgentEvent>`. Once somebody pulls, the producer blocks when the consumer is slow; before
+/// that the newest `capacity` events are kept, so a run nobody watches can never block on its own
+/// events. A late emit after close is counted and dropped, never thrown.
 public final class QueueSink implements EventSink {
-
-    /// Wraps a producer failure delivered through [#fail] to the pulling consumer.
-    public static final class EventStreamException extends RuntimeException {
-        EventStreamException(Throwable cause) { super("event producer failed", cause); }
-    }
 
     private static final Object EOS = new Object();
     private static final int DEFAULT_CAPACITY = 256;
@@ -35,15 +30,17 @@ public final class QueueSink implements EventSink {
 
     public QueueSink(int capacity) { this.queue = new LinkedBlockingQueue<>(capacity); }
 
-    @Override public void emit(AgentEvent event) { offer(event); }
-
-    @Override public void fail(Throwable cause) { offer(cause); }
+    @Override public void emit(AgentEvent event) {
+        if (closed.get() || abandoned.get()) { dropped.incrementAndGet(); return; }
+        enqueue(event);
+    }
 
     @Override public void close() {
         if (closed.compareAndSet(false, true)) enqueue(EOS);
     }
 
-    /// Events that arrived after [#close] or after the consumer abandoned the stream.
+    /// Events that arrived after [#close], after the consumer abandoned the stream, or that were
+    /// pushed out of the buffer before anyone pulled.
     public int dropped() { return dropped.get(); }
 
     /// @throws IllegalStateException on a second call — the queue is single-consumer
@@ -61,7 +58,6 @@ public final class QueueSink implements EventSink {
                 if (!hasNext()) throw new NoSuchElementException();
                 Object o = next;
                 next = null;
-                if (o instanceof Throwable t) throw new EventStreamException(t);
                 return (AgentEvent) o;
             }
         };
@@ -69,13 +65,6 @@ public final class QueueSink implements EventSink {
                 .onClose(() -> { abandoned.set(true); queue.clear(); });
     }
 
-    private void offer(Object item) {
-        if (closed.get() || abandoned.get()) { dropped.incrementAndGet(); return; }
-        enqueue(item);
-    }
-
-    /// Backpressure applies only once somebody is pulling. Before that, the newest `capacity`
-    /// items are kept and the oldest dropped, so a run nobody watches can never block on its own events.
     private void enqueue(Object item) {
         if (!consumed.get()) {
             while (!queue.offer(item)) {

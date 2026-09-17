@@ -12,5 +12,4 @@ import java.lang.annotation.Target;
 @Target({ElementType.RECORD_COMPONENT, ElementType.TYPE})
 public @interface Doc {
     String value();
-    String[] examples() default {};
 }

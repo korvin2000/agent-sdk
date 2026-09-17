@@ -14,7 +14,7 @@ import sdk.agent.message.AssistantMessage;
 import sdk.agent.message.ContentBlock;
 import sdk.agent.message.ToolResultMessage;
 
-/// Records every event of a run and asserts the twelve invariants of §4.2.3 over the recording.
+/// Records every event of a run and asserts the twelve event invariants over the recording.
 ///
 /// Deliberately framework-free: a failure is a plain [AssertionError] carrying the invariant
 /// number, what was expected, what was seen and the offending index, so the same sink works from
@@ -23,7 +23,7 @@ import sdk.agent.message.ToolResultMessage;
 ///
 /// **Two invariants are weaker here than their one-line statement, and deliberately so.**
 ///  * I10 (`toolCalls().size() == toolResults().size()`) holds for a turn that *ran* tools. The
-///    `Stop`/`Retry` rows of §4.3.2 emit `TurnEnd(assistant, [])` for an assistant that may carry
+///    `Stop`/`Retry` verdicts emit `TurnEnd(assistant, [])` for an assistant that may carry
 ///    tool-call blocks — a malformed batch is refused before any `ToolStart`. So the check is:
 ///    a turn with any `ToolStart` must be fully index-aligned; a turn with none must have no
 ///    results at all.
@@ -35,7 +35,6 @@ public final class RecordingSink implements EventSink {
 
     private final Object lock = new Object();
     private final List<AgentEvent> events = new ArrayList<>();
-    private final List<Throwable> failures = new ArrayList<>();
     private boolean closed;
     private int late;
 
@@ -47,10 +46,6 @@ public final class RecordingSink implements EventSink {
             if (closed) late++;
             events.add(event);
         }
-    }
-
-    @Override public void fail(Throwable cause) {
-        synchronized (lock) { failures.add(cause); }
     }
 
     @Override public void close() {
@@ -73,22 +68,18 @@ public final class RecordingSink implements EventSink {
         return all.getFirst();
     }
 
-    /// The compact event-type trace, for golden comparison against §4.3.2's table.
+    /// The compact event-type trace, for golden comparison.
     public List<String> trace() {
         return events().stream().map(e -> e.getClass().getSimpleName()).toList();
     }
 
-    /// Events recorded after [#close] — I12's "late emits counted, never thrown".
+    /// Events recorded after [#close] — late emits are counted, never thrown.
     public int lateEvents() {
         synchronized (lock) { return late; }
     }
 
-    public List<Throwable> failures() {
-        synchronized (lock) { return List.copyOf(failures); }
-    }
-
     public void clear() {
-        synchronized (lock) { events.clear(); failures.clear(); closed = false; late = 0; }
+        synchronized (lock) { events.clear(); closed = false; late = 0; }
     }
 
     /// The text of the tool result recorded for `toolCallId`.
@@ -211,7 +202,7 @@ public final class RecordingSink implements EventSink {
                     }
                 }
 
-                case AgentEvent.ToolStart(_, _, _, var id, _, _, _) -> {
+                case AgentEvent.ToolStart(_, _, _, var id, _, _) -> {
                     if (!seenTools.add(id)) throw fail("I5", "one ToolStart per tool call id", "a second ToolStart for " + id, i, all);
                     openTools.add(id);
                     turnAnnouncedATool = true;

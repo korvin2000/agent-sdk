@@ -18,8 +18,6 @@ import org.junit.jupiter.api.Test;
 import sdk.agent.RunLimits;
 import sdk.agent.concurrent.Cancellation;
 import sdk.agent.event.RunOutcome;
-import sdk.agent.hook.Thrash;
-import sdk.agent.hook.ThrashCounters;
 import sdk.agent.hook.TurnContext;
 import sdk.agent.hook.TurnGuard;
 import sdk.agent.hook.TurnVerdict;
@@ -36,10 +34,9 @@ import sdk.agent.tool.ToolKind;
 import sdk.agent.tool.ToolRegistry;
 import sdk.agent.tool.ToolSpec;
 
-/// Phase 8 of §5: pure verdict tests. Feed [AssistantMessage] sequences, assert the Verdict column
-/// of the §4.11.3 table — including the two rules that deviate from both upstreams: `tripped`
-/// **zeroes** the other tiers and `healthy` **decays** rather than zeroing.
-@DisplayName("TurnGuard — the §4.11.3 table")
+/// Pure verdict tests: feed [AssistantMessage] sequences and assert the verdict — including the
+/// two streak rules: `tripped` **zeroes** the other tiers and `healthy` **decays** rather than zeroing.
+@DisplayName("TurnGuard verdicts")
 final class TurnGuardTest {
 
     private static final ModelRef MODEL = new ModelRef("test", "scripted", "scripted-1", 200_000, 8_000);
@@ -265,29 +262,6 @@ final class TurnGuardTest {
             assertEquals(TurnGuard.CONTINUE_NUDGE, repromptOf(guard.afterAssistant(empty, ctx(cycle * 2 + 1))));
             assertEquals(TurnGuard.TRUNCATED_TURN_INSTRUCTION, repromptOf(guard.afterAssistant(truncated, ctx(cycle * 2 + 2))));
         }
-    }
-
-    @Test
-    @DisplayName("ThrashCounters: the N-th failing turn of a kind is refused; caps are validated by name")
-    void thrashCountersSemantics() {
-        var counters = new ThrashCounters(ThrashCounters.defaultCaps());
-        assertTrue(!counters.tripped(Thrash.EMPTY));
-        assertTrue(counters.tripped(Thrash.EMPTY), "cap 2 means the second consecutive empty turn is refused");
-
-        var mixed = new ThrashCounters(ThrashCounters.defaultCaps());
-        assertTrue(!mixed.tripped(Thrash.EMPTY));
-        assertTrue(!mixed.tripped(Thrash.MALFORMED), "a different failure mode zeroes the others");
-        assertEquals(0, mixed.count(Thrash.EMPTY));
-        assertTrue(!mixed.tripped(Thrash.EMPTY));
-
-        var decaying = new ThrashCounters(ThrashCounters.defaultCaps());
-        assertTrue(!decaying.tripped(Thrash.MALFORMED));
-        decaying.healthy();
-        assertEquals(0, decaying.count(Thrash.MALFORMED), "a healthy turn decays by one, it does not reset the budget");
-
-        var thrown = org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class,
-                () -> new ThrashCounters(Map.of()));
-        assertTrue(thrown.getMessage().startsWith("cap for "), "an empty map must name the missing tier, not die inside EnumMap");
     }
 
     @Test

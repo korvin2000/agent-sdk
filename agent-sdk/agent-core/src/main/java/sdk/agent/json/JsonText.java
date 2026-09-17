@@ -7,11 +7,13 @@ import java.util.LinkedHashMap;
 /// A strict RFC 8259 parser and writer with no dependencies. Nesting is capped at 512 levels so a
 /// hostile document cannot blow the stack; strings round-trip every escape including surrogate
 /// pairs; numbers are kept exact.
-public final class StandardJsonCodec implements JsonCodec {
+final class JsonText {
 
     private static final int MAX_DEPTH = 512;
 
-    @Override public Json parse(CharSequence text) {
+    private JsonText() { }
+
+    static Json parse(CharSequence text) {
         var p = new Parser(text);
         p.skipWs();
         Json value = p.value(0);
@@ -20,15 +22,10 @@ public final class StandardJsonCodec implements JsonCodec {
         return value;
     }
 
-    @Override public String write(Json value) {
-        var sb = new StringBuilder(64);
-        write(sb, value, -1, 0);
-        return sb.toString();
-    }
-
-    @Override public String writePretty(Json value) {
-        var sb = new StringBuilder(128);
-        write(sb, value, 2, 0);
+    /// Compact, or two-space indented like `JSON.stringify(value, null, 2)`.
+    static String write(Json value, boolean pretty) {
+        var sb = new StringBuilder(pretty ? 128 : 64);
+        write(sb, value, pretty ? 2 : -1, 0);
         return sb.toString();
     }
 

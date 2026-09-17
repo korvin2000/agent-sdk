@@ -32,16 +32,16 @@ import sdk.agent.tool.ToolKind;
 import sdk.agent.tool.ToolMessages;
 import sdk.agent.tool.ToolResult;
 
-/// Phase 6 of §5: the ten rows of the §4.3.5 funnel table, each with its [ErrorKind] and, for the
+/// The ten rows of the funnel table, each with its [ErrorKind] and, for the
 /// six verbatim strings, a byte-exact assertion. Every row is driven through the real engine, so
 /// what is asserted is the funnel's *one exit point* — `ToolEnd` and a transcript entry exist for
 /// every `ToolStart` whatever fails.
 ///
 /// The rig runs with **no [sdk.agent.hook.TurnGuard]**: the guard's `MALFORMED` tier refuses a turn
 /// whose every call is unusable *before* the funnel sees it, so the funnel's own preflight rows are
-/// only reachable with loop policy removed — which is exactly the removability §4.11 claims.
+/// only reachable with loop policy removed — which is exactly the removability the hook design claims.
 @Timeout(value = 20, unit = TimeUnit.SECONDS)
-@DisplayName("ToolFunnel — the ten rows of §4.3.5")
+@DisplayName("ToolFunnel — the ten rows")
 final class ToolFunnelTableTest {
 
     private static ScriptedProvider calling(String tool, String argumentsJson) {
@@ -367,7 +367,7 @@ final class ToolFunnelTableTest {
         rig.sink.assertInvariants();
         assertEquals(List.of("call-1", "call-2", "call-3"),
                 rig.sink.ofType(AgentEvent.ToolEnd.class).stream().map(AgentEvent.ToolEnd::toolCallId).toList(),
-                "pi emits [unknownTool, good, good] here; §4.3.3 fixes that");
+                "results stay in source order even when the first call is unknown");
         assertEquals("Tool gone not found", rig.sink.toolResult("call-2").orElseThrow().text());
     }
 }

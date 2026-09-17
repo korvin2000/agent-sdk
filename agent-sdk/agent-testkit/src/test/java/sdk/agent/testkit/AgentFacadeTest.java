@@ -34,7 +34,7 @@ import sdk.agent.spi.Contributions;
 import sdk.agent.spi.Extension;
 import sdk.agent.tool.Tool;
 
-/// The facade's four deliberate divergences from pi (§4.3.7): `abort()` clears the queues,
+/// The facade: `abort()` clears the queues,
 /// `reset()` aborts and waits, listener throws are isolated, late events never throw — plus the
 /// two completion rules that keep the event side and the result side from starving each other.
 @Timeout(value = 30, unit = TimeUnit.SECONDS)
@@ -121,7 +121,7 @@ final class AgentFacadeTest {
         RunResult result = run.result().get(10, TimeUnit.SECONDS);
         assertEquals(new RunOutcome.Aborted(), result.outcome());
         assertFalse(run.result().isCompletedExceptionally(), "a failure is a RunOutcome, not a thrown exception");
-        assertEquals(0, agent.state().pendingSteering(), "pi leaves the queues filled, costing one more turn");
+        assertEquals(0, agent.state().pendingSteering());
         assertEquals(0, agent.state().pendingFollowUps());
     }
 
@@ -158,7 +158,7 @@ final class AgentFacadeTest {
         agent.steer(UserMessage.text("queued"));
         agent.reset();
 
-        assertTrue(agent.transcript().isEmpty(), "pi's reset leaves activeRun live, pushing into a cleared transcript");
+        assertTrue(agent.transcript().isEmpty());
         assertEquals(0, agent.state().pendingSteering());
         assertEquals(0, agent.state().transcriptSize());
         assertFalse(agent.state().running());
@@ -220,29 +220,6 @@ final class AgentFacadeTest {
         assertEquals(5, snapshot.transcriptSize(), "prompt, assistant, two results, closing assistant");
         assertEquals(1, snapshot.turnIndex());
         assertEquals(0, snapshot.pendingSteering());
-    }
-
-    @Test
-    @DisplayName("agent.events() spans every future run; a run's own close() must not end it")
-    void agentEventsSpanTwoRuns() throws Exception {
-        Agent agent = build(ScriptedProvider.simpleText());
-        var stream = agent.events();
-        var collected = new CopyOnWriteArrayList<AgentEvent>();
-        var ended = new CountDownLatch(1);
-        Thread consumer = Thread.ofVirtual().start(() -> {
-            stream.forEach(collected::add);
-            ended.countDown();
-        });
-
-        agent.prompt("one").result().get(10, TimeUnit.SECONDS);
-        agent.prompt("two").result().get(10, TimeUnit.SECONDS);
-        agent.close();                                            // the agent owns these queues, not the run
-
-        assertTrue(ended.await(10, TimeUnit.SECONDS), "closing the agent ends its pull streams");
-        consumer.join();
-        assertEquals(2, collected.stream().filter(AgentEvent.RunStart.class::isInstance).count(),
-                "the agent-level stream sees every run, not just the first");
-        assertEquals(2, collected.stream().filter(AgentEvent.RunEnd.class::isInstance).count());
     }
 
     @Test

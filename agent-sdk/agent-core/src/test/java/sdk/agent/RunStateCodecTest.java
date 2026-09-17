@@ -26,8 +26,6 @@ import sdk.agent.message.StopReason;
 import sdk.agent.message.ToolResultMessage;
 import sdk.agent.message.Usage;
 import sdk.agent.message.UserMessage;
-import sdk.agent.turn.ArgAccumulator;
-import sdk.agent.turn.OpenBlock;
 import sdk.agent.turn.TurnPhase;
 import sdk.agent.turn.TurnState;
 
@@ -41,20 +39,17 @@ class RunStateCodecTest {
         var assistant = new AssistantMessage(List.of(new ContentBlock.Thinking("hm", "s", false), ContentBlock.Text.of("hi"), call),
                 MODEL, "resp-1", Usage.tokens(10, 5), StopReason.TOOL_USE, null, AT);
         var result = new ToolResultMessage("c1", "read", List.of(ContentBlock.Text.of("content")), Json.obj("k", Json.num(1)), false, AT);
-        var active = new LinkedHashMap<Integer, ArgAccumulator>();
-        active.put(2, new ArgAccumulator("c2", "bash", "{\"command\":", Json.obj("command", Json.str("ls")), null));
-        var turn = new TurnState("run-1", 1, TurnPhase.TOOLS_RUNNING, MODEL,
-                List.of(ContentBlock.Text.of("partial")), Optional.of(new OpenBlock(OpenBlock.Kind.TEXT, 0, "open", null, false)),
-                active, Map.of("c9", "cut off"), assistant, List.of(Optional.of(result)), true);
+        var turn = new TurnState("run-1", 1, TurnPhase.TOOLS_RUNNING, MODEL, assistant.content(), Optional.empty(),
+                new LinkedHashMap<>(), Map.of("c9", "cut off"), assistant, List.of(Optional.of(result)), true);
         List<AgentMessage> transcript = List.of(
                 UserMessage.of("look", List.of(new ContentBlock.Image("AAAA", "image/png"))),
                 assistant, result,
                 new CustomMessage("todo.snapshot", Json.obj("tasks", Json.arr()), AT),
                 new UserMessage(List.of(new ContentBlock.Resource(URI.create("file:///x"), "text/plain", Optional.of("t"), Optional.empty()),
                                         new ContentBlock.Audio("BBBB", "audio/wav")), AT));
-        return new RunState("run-1", Phase.TOOLS_RUNNING, 1, transcript, transcript.subList(1, 3), List.of(UserMessage.text("next", AT)),
+        return new RunState("run-1", Phase.TOOLS_RUNNING, 1, transcript, 1, List.of(UserMessage.text("next", AT)),
                 turn, RunLimits.DEFAULTS.withWallClock(Duration.ofMinutes(5)).withToolExecution(ToolExecutionMode.SEQUENTIAL),
-                2, 1, Usage.tokens(10, 5), AT, true, new RunOutcome.LimitExceeded(RunOutcome.Limit.THRASH, "d"), RunState.SCHEMA_VERSION, "hash");
+                2, 1, Usage.tokens(10, 5), AT, new RunOutcome.LimitExceeded(RunOutcome.Limit.THRASH, "d"), "hash");
     }
 
     @Test
@@ -65,6 +60,7 @@ class RunStateCodecTest {
         RunState back = codec.decode(Json.parse(json.toText()));
         assertEquals(original, back);
         assertEquals(json, codec.encode(back));
+        assertEquals(original.transcript().subList(1, 5), back.produced());
     }
 
     @Test

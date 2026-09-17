@@ -8,6 +8,4 @@ import sdk.agent.tool.Tool;
 public record PromptContext(List<Tool<?>> tools) {
 
     public PromptContext { tools = List.copyOf(tools); }
-
-    public boolean has(String toolName) { return tools.stream().anyMatch(t -> t.name().equals(toolName)); }
 }

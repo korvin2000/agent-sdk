@@ -59,11 +59,9 @@ class SystemPromptBuilderTest {
     }
 
     @Test
-    @DisplayName("the context answers has() from the registered tools")
+    @DisplayName("the context lists the registered tools in order")
     void contextKnowsItsTools() {
         var ctx = new PromptContext(List.of(stub("read")));
-        assertTrue(ctx.has("read"));
-        assertFalse(ctx.has("write"));
         assertEquals(List.of("read"), ctx.tools().stream().map(Tool::name).toList());
     }
 

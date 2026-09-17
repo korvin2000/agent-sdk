@@ -20,7 +20,7 @@ import java.util.Set;
 public sealed interface McpServerConfig {
 
     /// Used when a config leaves `requestTimeout` null. The SDK's own timeout is set slightly
-    /// longer than this so ours wins and produces a uniform error envelope (§4.14.5).
+    /// longer than this so ours wins and produces a uniform error envelope.
     Duration DEFAULT_REQUEST_TIMEOUT = Duration.ofSeconds(30);
 
     /// Raw, as written by the host. [McpNaming#sanitizeServer] is applied once, at pool start.
@@ -36,7 +36,7 @@ public sealed interface McpServerConfig {
     /// A child process speaking JSON-RPC over stdin/stdout.
     ///
     /// @param cwd the child's working directory, or `null` to inherit ours. `ServerParameters`
-    ///            carries no working directory (§4.14.10 item 4), so [McpTransports] supplies one
+    ///            carries no working directory, so [McpTransports] supplies one
     ///            by overriding `StdioClientTransport.getProcessBuilder()`.
     record Stdio(String name, String command, List<String> args, Map<String, String> env,
                  Path cwd, Duration requestTimeout, Set<String> toolFilter, boolean enabled)

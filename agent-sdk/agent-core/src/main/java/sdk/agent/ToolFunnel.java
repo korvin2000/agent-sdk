@@ -31,7 +31,7 @@ import sdk.agent.tool.ToolResult;
 /// crashed, cancelled or successful — leaves through [#emitOutcome], so a `ToolEnd` and a
 /// `ToolResultMessage` are structurally guaranteed for every `ToolStart`.
 ///
-/// A batch runs in three phases (pi's, with its ordering bug fixed): announce + prepare
+/// A batch runs in three phases: announce + prepare
 /// **sequentially in source order** (so a permission prompt cannot race), launch the runnable
 /// calls concurrently, then drain and emit **strictly by index**.
 final class ToolFunnel {
@@ -61,7 +61,7 @@ final class ToolFunnel {
         int n = batch.size();
         var prepared = new ArrayList<Prepare>(n);
         for (ContentBlock.ToolCall call : batch) {                                  // phase 1
-            emit.accept(new AgentEvent.ToolStart(run.runId(), run.turnIndex(), now(), call.id(), call.name(), call.arguments(), null));
+            emit.accept(new AgentEvent.ToolStart(run.runId(), run.turnIndex(), now(), call.id(), call.name(), call.arguments()));
             prepared.add(prepare(call));
         }
 

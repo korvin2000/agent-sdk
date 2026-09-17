@@ -35,7 +35,7 @@ import sdk.agent.turn.TurnMachine;
 import sdk.agent.turn.TurnPhase;
 import sdk.agent.turn.TurnState;
 
-/// Phase 5 of §5: the turn machine driven entirely by hand-written [StepInput] sequences. No
+/// The turn machine driven entirely by hand-written [StepInput] sequences. No
 /// provider, no filesystem, no threads and no clock — `step` takes the instant explicitly — so
 /// every claim about ordering and about the stale-snapshot rule is checkable before a thread exists.
 @DisplayName("TurnMachine (pure, no I/O)")
