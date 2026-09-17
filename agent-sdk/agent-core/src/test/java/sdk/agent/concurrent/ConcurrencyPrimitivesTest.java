@@ -1,0 +1,93 @@
+package sdk.agent.concurrent;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import java.time.Duration;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import org.junit.jupiter.api.Test;
+
+class ConcurrencyPrimitivesTest {
+
+    @Test
+    void listenersRunOnceInOrderAndLateRegistrationFiresImmediately() {
+        var c = Cancellation.create();
+        var order = new ArrayList<String>();
+        c.onCancel(() -> order.add("a"));
+        c.onCancel(() -> { throw new RuntimeException("boom"); });
+        c.onCancel(() -> order.add("b"));
+        c.cancel();
+        c.cancel();
+        assertEquals(List.of("a", "b"), order);
+        c.onCancel(() -> order.add("late"));
+        assertEquals(List.of("a", "b", "late"), order);
+        assertThrows(CancelledException.class, c::throwIfCancelled);
+    }
+
+    @Test
+    void registrationCloseDeregistersAndLinkIsOneWay() {
+        var parent = Cancellation.create();
+        var child = Cancellation.linkedTo(parent);
+        var count = new AtomicInteger();
+        Cancellation.Registration reg = child.onCancel(count::incrementAndGet);
+        reg.close();
+        child.cancel();
+        assertEquals(0, count.get());
+        assertFalse(parent.isCancelled());
+
+        var child2 = Cancellation.linkedTo(parent);
+        parent.cancel();
+        assertTrue(child2.isCancelled());
+    }
+
+    @Test
+    void forkRebindsRunScopeAndRunScopeThrowsWhenUnbound() throws Exception {
+        assertThrows(IllegalStateException.class, RunScope::current);
+        var scope = new RunScope("run-1", 3, Cancellation.create());
+        String seen = scope.call(() -> {
+            try (var fork = Fork.open()) {
+                return fork.fork(() -> RunScope.current().runId() + "/" + RunScope.current().turnIndex()).get();
+            }
+        });
+        assertEquals("run-1/3", seen);
+        assertTrue(RunScope.currentIfBound().isEmpty());
+    }
+
+    @Test
+    void forkJoinUntilTimesOutAndCloseNeverHangs() throws Exception {
+        var leaked = new ArrayList<String>();
+        var started = new CountDownLatch(1);
+        var stop = new java.util.concurrent.atomic.AtomicBoolean();
+        Instant before = Instant.now();
+        try (var fork = Fork.open(Duration.ofMillis(200), leaked::add)) {
+            fork.fork("stubborn", () -> {
+                started.countDown();
+                while (!stop.get()) Thread.onSpinWait();          // ignores interrupt on purpose
+                return null;
+            });
+            started.await();
+            assertThrows(TimeoutException.class, () -> fork.joinUntil(Instant.now().plusMillis(50)));
+        } finally {
+            stop.set(true);
+        }
+        assertTrue(Duration.between(before, Instant.now()).toMillis() < 5_000, "close() must be bounded by the grace period");
+        assertEquals(List.of("stubborn"), leaked);
+    }
+
+    @Test
+    void forkCancelAllInterruptsTasks() throws Exception {
+        try (var fork = Fork.open()) {
+            var handle = fork.fork(() -> { Thread.sleep(10_000); return "done"; });
+            fork.cancelAll();
+            assertThrows(java.util.concurrent.CancellationException.class, handle::get);
+        }
+    }
+}
