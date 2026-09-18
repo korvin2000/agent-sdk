@@ -12,6 +12,7 @@ import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
@@ -21,22 +22,29 @@ import org.junit.jupiter.api.Timeout;
 import sdk.agent.Agent;
 import sdk.agent.AgentRun;
 import sdk.agent.AgentSnapshot;
+import sdk.agent.Phase;
 import sdk.agent.RunLimits;
 import sdk.agent.RunResult;
+import sdk.agent.RunStateCodec;
 import sdk.agent.event.AgentEvent;
 import sdk.agent.event.RunOutcome;
+import sdk.agent.hook.AgentHooks;
+import sdk.agent.hook.TurnContext;
+import sdk.agent.json.Json;
 import sdk.agent.message.StopReason;
+import sdk.agent.message.ToolResultMessage;
 import sdk.agent.message.Usage;
 import sdk.agent.message.UserMessage;
 import sdk.agent.provider.LlmProvider;
+import sdk.agent.provider.LlmRequest;
 import sdk.agent.provider.LlmStreamEvent;
 import sdk.agent.spi.Contributions;
 import sdk.agent.spi.Extension;
 import sdk.agent.tool.Tool;
 
-/// The facade: `abort()` clears the queues,
-/// `reset()` aborts and waits, listener throws are isolated, late events never throw — plus the
-/// two completion rules that keep the event side and the result side from starving each other.
+/// The facade: `abort()` clears the queues, `reset()` aborts and waits, `close()` is idempotent
+/// and final, listener throws are isolated, late events never throw — plus the two completion
+/// rules that keep the event side and the result side from starving each other.
 @Timeout(value = 30, unit = TimeUnit.SECONDS)
 @DisplayName("Agent facade")
 final class AgentFacadeTest {
@@ -164,6 +172,67 @@ final class AgentFacadeTest {
         assertFalse(agent.state().running());
     }
 
+    @Test
+    @DisplayName("close() is idempotent, closes each extension once and refuses new runs and messages")
+    void closeIsIdempotentAndFinal() throws Exception {
+        var closed = new AtomicInteger();
+        Agent agent = Agent.builder().provider(ScriptedProvider.simpleText()).turnGuard(null)
+                .extension(new Extension() {
+                    @Override public String id() { return "close-count"; }
+                    @Override public Contributions contributions() { return Contributions.NONE; }
+                    @Override public void close() { closed.incrementAndGet(); }
+                })
+                .build();
+        open.add(agent);
+        AgentRun run = agent.prompt("hi");
+        run.result().get(10, TimeUnit.SECONDS);
+
+        agent.close();
+        agent.close();
+
+        assertEquals(1, closed.get());
+        assertFalse(agent.state().running());
+        assertThrows(IllegalStateException.class, () -> agent.prompt("after close"));
+        assertThrows(IllegalStateException.class, agent::resume);
+        assertThrows(IllegalStateException.class, () -> agent.resume(run.state()));
+        assertThrows(IllegalStateException.class, agent::reset);
+        assertThrows(IllegalStateException.class, () -> agent.steer(UserMessage.text("late")));
+        assertThrows(IllegalStateException.class, () -> agent.followUp(UserMessage.text("late")));
+        agent.abort();                                                       // harmless on a closed agent
+    }
+
+    // ---- checkpoint and resume -----------------------------------------------------------------
+
+    @Test
+    @DisplayName("resume skips the settled slot and keeps the turn's originally advertised tools")
+    void resumeSkipsSettledSlotsAndKeepsTheTurnsAuthority() throws Exception {
+        var read = FakeTool.mutating("read", "read result");
+        var bash = FakeTool.mutating("bash", "must not run");
+        var rig = new Rig().provider(ScriptedProvider.defaultScenario()).tools(read, bash).sequential()
+                .hooks(new AgentHooks() {
+                    @Override public LlmRequest beforeRequest(LlmRequest request, TurnContext ctx) {
+                        return request.withTools(request.tools().stream().filter(t -> t.name().equals("read")).toList());
+                    }
+                });
+        var driver = rig.driver("checkpoint").until(Phase.TOOLS_RUNNING).one();       // read ran; bash is pending
+        var codec = RunStateCodec.builtIn();
+        var checkpoint = codec.decode(Json.parse(codec.encode(driver.state()).toText()));
+
+        Agent changedRegistry = build((_, _) -> { throw new AssertionError("provider must not open"); });
+        assertThrows(IllegalStateException.class, () -> changedRegistry.resume(checkpoint), "the tool set changed");
+
+        Agent agent = build(ScriptedProvider.simpleText(), read, bash);
+        RunResult result = agent.resume(checkpoint).result().get(10, TimeUnit.SECONDS);
+
+        assertTrue(result.isSuccess());
+        assertEquals(1, read.calls(), "the durably settled call is not replayed");
+        assertEquals(0, bash.calls(), "the original request never offered bash");
+        var results = result.state().transcript().stream().filter(ToolResultMessage.class::isInstance).map(ToolResultMessage.class::cast).toList();
+        assertEquals(2, results.size());
+        assertTrue(results.getLast().isError());
+        assertEquals(checkpoint.turn().pendingCalls().getFirst().id(), results.getLast().toolCallId());
+    }
+
     // ---- observation ---------------------------------------------------------------------------
 
     @Test
@@ -203,6 +272,18 @@ final class AgentFacadeTest {
     }
 
     @Test
+    @DisplayName("closing a partially consumed event stream abandons observation without stranding the run")
+    void closingAPartialEventStreamDoesNotStrandTheRun() throws Exception {
+        Agent agent = build(hanging());
+        AgentRun run = agent.prompt("hi");
+        try (var events = run.events()) {
+            assertInstanceOf(AgentEvent.RunStart.class, events.iterator().next());
+        }
+        agent.abort();
+        assertEquals(new RunOutcome.Aborted(), run.result().get(10, TimeUnit.SECONDS).outcome());
+    }
+
+    @Test
     @DisplayName("AgentSnapshot counts turns, tool calls and transcript entries")
     void snapshotCounts() throws Exception {
         Agent agent = build(ScriptedProvider.defaultScenario(),
@@ -223,7 +304,7 @@ final class AgentFacadeTest {
     }
 
     @Test
-    @DisplayName("a run nobody pulls still finishes: before a consumer arrives the newest events are kept, not backpressured")
+    @DisplayName("a run nobody pulls still finishes: the newest events are kept, the run is never backpressured")
     void unconsumedEventQueueDoesNotBlockTheRun() throws Exception {
         Agent agent = build(manyTextDeltas(600));                  // far past QueueSink's 256 capacity
 

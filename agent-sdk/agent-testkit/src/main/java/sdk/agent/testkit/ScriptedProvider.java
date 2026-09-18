@@ -269,8 +269,8 @@ public final class ScriptedProvider implements LlmProvider {
         return of(steps);
     }
 
-    /// **10.** A `read` call whose arguments are **complete**, then a hang. Pins that a stall with
-    /// valid JSON still yields a usable call — the stall flag alone must not veto execution.
+    /// **10.** A `read` call whose arguments are **complete**, then a hang. Pins that a stall is a
+    /// failed turn: the call is kept for diagnosis but never executed.
     public static ScriptedProvider toolHang() {
         return of(List.of(
                 emit(new LlmStreamEvent.Start()),
@@ -282,8 +282,8 @@ public final class ScriptedProvider implements LlmProvider {
                 hang()));
     }
 
-    /// **11.** A `write` call cut off mid-JSON, then a hang, with **no** start snapshot. Pins the
-    /// stalled preflight string and that nothing executes.
+    /// **11.** A `write` call cut off mid-JSON, then a hang, with **no** start snapshot. Pins that
+    /// nothing executes and the call carries `Json.Null` arguments.
     public static ScriptedProvider toolHangInvalidJson() {
         return of(List.of(
                 emit(new LlmStreamEvent.Start()),
@@ -293,9 +293,8 @@ public final class ScriptedProvider implements LlmProvider {
     }
 
     /// **12. The stale-snapshot trap.** A `write` whose `initialArguments` name `/tmp/stale.txt`,
-    /// then a truncated `replace = true` delta, then a hang. Pins that the fallback to
-    /// `initialArguments` is **suppressed when the stream stalled** — otherwise the engine writes
-    /// the stale path. The single subtlest rule in the engine.
+    /// then a truncated `replace = true` delta, then a hang. Pins that received fragments are
+    /// authoritative: malformed JSON never falls back to the snapshot, so the stale path is never written.
     public static ScriptedProvider toolHangWithInitialArgs() {
         return of(List.of(
                 emit(new LlmStreamEvent.Start()),

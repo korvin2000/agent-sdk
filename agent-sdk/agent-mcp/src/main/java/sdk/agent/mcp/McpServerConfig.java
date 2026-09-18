@@ -66,8 +66,10 @@ public sealed interface McpServerConfig {
         public Http {
             name = requireText(name, "name");
             Objects.requireNonNull(url, "url");
-            if (url.getScheme() == null || url.getHost() == null) {
-                throw new IllegalArgumentException("MCP http url must be absolute with a host: " + url);
+            String scheme = url.getScheme();
+            if (scheme == null || !(scheme.equalsIgnoreCase("http") || scheme.equalsIgnoreCase("https"))
+                    || url.getHost() == null || url.getHost().isBlank() || url.getUserInfo() != null || url.getRawFragment() != null) {
+                throw new IllegalArgumentException("MCP http url must be http(s) with a host and no user-info or fragment: " + url);
             }
             headers = headers == null ? Map.of() : Collections.unmodifiableMap(new LinkedHashMap<>(headers));
             requestTimeout = timeoutOr(requestTimeout);

@@ -6,8 +6,8 @@ import sdk.agent.json.Json;
 
 /// Per-tool-call argument assembly across deltas, keyed in the turn state by content index for the
 /// **whole turn** — a content-block transition never flushes it. `fragments` is concatenated, never
-/// parsed incrementally; `initialArguments` is the provider's start-of-call snapshot and is used
-/// only by the stale-snapshot rule.
+/// parsed incrementally; `initialArguments` is the provider's start-of-call snapshot, used only
+/// when no fragment arrives.
 public record ArgAccumulator(String toolCallId, String toolName, String fragments, Json initialArguments) {
 
     public ArgAccumulator {

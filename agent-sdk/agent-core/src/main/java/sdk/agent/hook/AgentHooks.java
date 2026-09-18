@@ -11,8 +11,10 @@ import sdk.agent.provider.LlmRequest;
 
 /// The one hook interface. Skills, permissions, sandboxing, git snapshotting, TODO tracking, loop
 /// detection and compaction are all implementations of this, registered into a [CompositeHooks],
-/// with zero core edits. Every call site in the engine is individually guarded: a throwing hook
-/// degrades to its stated fallback and never removes a `ToolEnd` or a tool result.
+/// with zero core edits. Decision hooks **fail closed**: a throw from [#beforeToolCall] or
+/// [#afterToolCall] becomes that call's `HOOK_FAILED` result, a throw from any other decision ends
+/// the run as `Failed` — never a permissive fallback, and never a lost `ToolEnd`. Only [#onEvent]
+/// is isolated.
 public interface AgentHooks {
 
     AgentHooks NONE = new AgentHooks() { };

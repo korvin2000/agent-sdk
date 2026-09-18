@@ -7,6 +7,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 import java.util.OptionalLong;
+import java.util.stream.Collectors;
 
 import sdk.agent.event.AgentEvent;
 import sdk.agent.hook.TurnVerdict;
@@ -17,20 +18,26 @@ import sdk.agent.message.ContentBlock;
 import sdk.agent.message.StopReason;
 import sdk.agent.message.ToolResultMessage;
 import sdk.agent.message.Usage;
+import sdk.agent.provider.LlmRequest;
 import sdk.agent.provider.LlmStreamEvent;
 import sdk.agent.tool.ToolMessages;
+import sdk.agent.tool.ToolSpec;
 
 /// The turn as a pure state machine: total and deterministic — same `(state, input, now)` → same
 /// `(events, next)`. No clock, no I/O, no threads, so every event invariant is assertable by feeding
 /// hand-written inputs. The driver (`RunEngine`) owns the I/O and satisfies each [Need].
 ///
-/// Three provider failure modes collapse to one path: an exception, a stream ending with no terminal
-/// event, and a stall all produce an assistant message with `stopReason ∈ {ERROR, ABORTED}` or a
-/// `stalled` flag. Nothing throws, nothing hangs. The partial message never enters a transcript:
-/// only the final message is emitted, once, at `MessageEnd`.
+/// Every provider failure — an exception, a stream ending with no terminal event, a stall while a
+/// tool call is being assembled — becomes an assistant message with `stopReason ∈ {ERROR, ABORTED}`.
+/// Nothing throws, nothing hangs. The partial message never enters a transcript: only the final
+/// message is emitted, once, at `MessageEnd`. Every turn leaves through [#close], which pads the
+/// calls that never ran, so `TurnEnd` and the transcript carry one result per call however the
+/// turn ended — a provider rejects an assistant tool call with no matching result.
 public final class TurnMachine {
 
     public static final Duration DEFAULT_TOOL_IDLE_TIMEOUT = Duration.ofSeconds(180);
+
+    public static final String STALLED = "The provider stream stalled while assembling a tool call.";
 
     private final OptionalLong idleTimeoutMillis;
 
@@ -45,10 +52,7 @@ public final class TurnMachine {
     public StepOutcome step(TurnState s, StepInput in, Instant now) {
         if (in instanceof StepInput.Cancel && s.phase() != TurnPhase.CLOSED) return cancel(s, now);
         return switch (s.phase()) {
-            case OPENING          -> in instanceof StepInput.Begin(var request)
-                                        ? needs(s.toBuilder(), List.of(new AgentEvent.TurnStart(s.runId(), s.index(), now)),
-                                                TurnPhase.STREAM_REQUESTED, new Need.Stream(request))
-                                        : ignored(s, in);
+            case OPENING          -> in instanceof StepInput.Begin(var request) ? begin(s, request, now) : ignored(s, in);
             case STREAM_REQUESTED -> switch (in) {
                 case StepInput.StreamOpened() -> {
                     var b = s.toBuilder();
@@ -56,14 +60,14 @@ public final class TurnMachine {
                     yield new StepOutcome.Needs(List.of(new AgentEvent.MessageStart(s.runId(), s.index(), now, partial(s, now))),
                             b.build(), chunkNeed(s));
                 }
-                case StepInput.StreamFailed(var message, var aborted) -> finish(s, aborted ? StopReason.ABORTED : StopReason.ERROR, message, false, Usage.EMPTY, null, now);
+                case StepInput.StreamFailed(var message, var aborted) -> finish(s, aborted ? StopReason.ABORTED : StopReason.ERROR, message, Usage.EMPTY, null, now);
                 default -> ignored(s, in);
             };
             case STREAMING        -> switch (in) {
                 case StepInput.Chunk(var event)                        -> chunk(s, event, now);
-                case StepInput.StreamExhausted()                       -> finish(s, StopReason.ERROR, "The provider stream ended without a terminal event.", false, Usage.EMPTY, null, now);
-                case StepInput.StreamFailed(var message, var aborted)  -> finish(s, aborted ? StopReason.ABORTED : StopReason.ERROR, message, false, Usage.EMPTY, null, now);
-                case StepInput.IdleTimedOut()                          -> finish(s, StopReason.TOOL_USE, null, true, Usage.EMPTY, null, now);
+                case StepInput.StreamExhausted()                       -> finish(s, StopReason.ERROR, "The provider stream ended without a terminal event.", Usage.EMPTY, null, now);
+                case StepInput.StreamFailed(var message, var aborted)  -> finish(s, aborted ? StopReason.ABORTED : StopReason.ERROR, message, Usage.EMPTY, null, now);
+                case StepInput.IdleTimedOut()                          -> finish(s, StopReason.ERROR, STALLED, Usage.EMPTY, null, now);
                 default                                                -> ignored(s, in);
             };
             case ASSISTANT_READY  -> in instanceof StepInput.Verdict(var verdict) ? verdict(s, verdict, now) : ignored(s, in);
@@ -73,6 +77,14 @@ public final class TurnMachine {
     }
 
     // ---- streaming -----------------------------------------------------------------------------
+
+    /// The advertised tools are captured here: execution authority for the turn is what the model was offered.
+    private static StepOutcome begin(TurnState s, LlmRequest request, Instant now) {
+        var b = s.toBuilder();
+        b.allowedTools = request.tools().stream().map(ToolSpec::name).collect(Collectors.toSet());
+        b.phase = TurnPhase.STREAM_REQUESTED;
+        return new StepOutcome.Needs(List.of(new AgentEvent.TurnStart(s.runId(), s.index(), now)), b.build(), new Need.Stream(request));
+    }
 
     private StepOutcome chunk(TurnState s, LlmStreamEvent e, Instant now) {
         var b = s.toBuilder();
@@ -98,8 +110,8 @@ public final class TurnMachine {
                 b.activeCalls.remove(index);
                 b.content.add(call);
             }
-            case LlmStreamEvent.Done(var reason, var usage, var responseId) -> { return finish(s, reason, null, false, usage, responseId, now); }
-            case LlmStreamEvent.Failed(var reason, var message)             -> { return finish(s, reason, message, false, Usage.EMPTY, null, now); }
+            case LlmStreamEvent.Done(var reason, var usage, var responseId) -> { return finish(s, reason, null, usage, responseId, now); }
+            case LlmStreamEvent.Failed(var reason, var message)             -> { return finish(s, reason, message, Usage.EMPTY, null, now); }
         }
         TurnState next = b.build();
         var update = new AgentEvent.MessageUpdate(s.runId(), s.index(), now, partial(next, now), e);
@@ -118,8 +130,8 @@ public final class TurnMachine {
         return kind == OpenBlock.Kind.TEXT ? OpenBlock.text(index) : OpenBlock.thinking(index);
     }
 
-    /// Whitespace-only text never opens a block; an empty thinking block
-    /// survives only if it carries a signature or is redacted (required for redacted-reasoning round trips).
+    /// Whitespace-only text never opens a block (a provider rejects it on the way back); an empty
+    /// thinking block survives only if it carries a signature or is redacted (redacted-reasoning round trips).
     private static void closeOpen(TurnState.Builder b) {
         b.openBlock.ifPresent(open -> {
             boolean keep = switch (open.kind()) {
@@ -131,13 +143,14 @@ public final class TurnMachine {
         b.openBlock = Optional.empty();
     }
 
-    private StepOutcome finish(TurnState s, StopReason reason, String errorMessage, boolean stalled,
-                               Usage usage, String responseId, Instant now) {
+    /// Materialises the assistant message and sizes one result slot per call.
+    private static StepOutcome finish(TurnState s, StopReason reason, String errorMessage, Usage usage, String responseId, Instant now) {
         var b = s.toBuilder();
         closeOpen(b);
-        flushActiveCalls(b, stalled);
-        b.stalled = stalled;
+        flushActiveCalls(b);
         b.assistant = new AssistantMessage(b.content, s.model(), responseId, usage, reason, errorMessage, now);
+        b.content.clear();
+        b.slots = new ArrayList<>(Collections.nCopies(b.assistant.toolCalls().size(), Optional.empty()));
         b.phase = TurnPhase.ASSISTANT_READY;
         TurnState next = b.build();
         // A turn that dies before its stream opened still owes TurnStart/MessageStart (I3, I8).
@@ -148,10 +161,10 @@ public final class TurnMachine {
         return new StepOutcome.Needs(events, next, new Need.Verdict(next.assistant()));
     }
 
-    /// The stale-snapshot rule: on a parse failure fall back to the
-    /// start-of-call snapshot **only if the stream did not stall** — after a stall the snapshot
-    /// is stale and the fragments are truncated, so the call is marked unusable instead.
-    private static void flushActiveCalls(TurnState.Builder b, boolean stalled) {
+    /// Received fragments are authoritative: unparseable arguments become `Json.Null`, which the
+    /// funnel refuses with [ToolMessages#ARGS_INVALID_JSON]. The start-of-call snapshot is used only
+    /// when no fragment arrived at all (a provider that sends the arguments whole).
+    private static void flushActiveCalls(TurnState.Builder b) {
         for (ArgAccumulator acc : b.activeCalls.values()) {
             String fragments = acc.fragments().strip();
             Json arguments;
@@ -161,15 +174,7 @@ public final class TurnMachine {
                 try {
                     arguments = Json.parse(fragments);
                 } catch (JsonParseException _) {
-                    if (stalled) {
-                        arguments = Json.Null.NULL;
-                        b.preflight.put(acc.toolCallId(), ToolMessages.ARGS_CUT_OFF_BY_STALL);
-                    } else if (acc.initialArguments() instanceof Json.Obj o && !o.isEmpty()) {
-                        arguments = o;
-                    } else {
-                        arguments = Json.Null.NULL;
-                        b.preflight.put(acc.toolCallId(), ToolMessages.ARGS_INVALID_JSON);
-                    }
+                    arguments = Json.Null.NULL;
                 }
             }
             b.content.add(new ContentBlock.ToolCall(acc.toolCallId(), acc.toolName(), arguments, null));
@@ -186,19 +191,16 @@ public final class TurnMachine {
 
     // ---- verdict and tools ---------------------------------------------------------------------
 
+    /// Only `Proceed` on a healthy turn with calls runs anything; `Stop`, `Retry`, a failed turn
+    /// and a turn without calls all close, padding whatever the model asked for.
     private StepOutcome verdict(TurnState s, TurnVerdict verdict, Instant now) {
-        return switch (verdict) {
-            case TurnVerdict.Stop _, TurnVerdict.Retry _ -> close(s.toBuilder(), List.of(), now);
-            case TurnVerdict.Proceed _ -> {
-                List<ContentBlock.ToolCall> calls = s.calls();
-                if (calls.isEmpty()) yield close(s.toBuilder(), List.of(), now);
-                var b = s.toBuilder();
-                b.slots = new ArrayList<>(Collections.nCopies(calls.size(), Optional.empty()));
-                b.phase = TurnPhase.TOOLS_RUNNING;
-                TurnState next = b.build();
-                yield new StepOutcome.Needs(List.of(), next, new Need.Tools(next.pendingCalls()));
-            }
-        };
+        if (!(verdict instanceof TurnVerdict.Proceed) || s.assistant().terminal() || s.calls().isEmpty()) {
+            return close(s.toBuilder(), now);
+        }
+        var b = s.toBuilder();
+        b.phase = TurnPhase.TOOLS_RUNNING;
+        TurnState next = b.build();
+        return new StepOutcome.Needs(List.of(), next, new Need.Tools(next.pendingCalls()));
     }
 
     private StepOutcome settled(TurnState s, String toolCallId, ToolResultMessage result, Instant now) {
@@ -210,43 +212,39 @@ public final class TurnMachine {
         var b = s.toBuilder();
         b.slots.set(index, Optional.of(result));
         TurnState next = b.build();
-        if (next.allSettled()) return close(b, List.of(), now);
+        if (next.allSettled()) return close(b, now);
         return new StepOutcome.Needs(List.of(), next, new Need.Tools(next.pendingCalls()));
     }
 
+    /// Abort, or "finish this turn without running anything else": a turn with no final message
+    /// yet gets an `ABORTED` one, then the turn closes with every open slot padded.
     private StepOutcome cancel(TurnState s, Instant now) {
-        if (s.assistant() == null) {
-            return finish(s, StopReason.ABORTED, "The run was aborted.", false, Usage.EMPTY, null, now);
-        }
-        var b = s.toBuilder();
-        var padded = new ArrayList<AgentEvent>();
-        List<ContentBlock.ToolCall> calls = s.calls();
-        for (int i = 0; i < b.slots.size(); i++) {
+        if (s.assistant() != null) return close(s.toBuilder(), now);
+        StepOutcome ready = finish(s, StopReason.ABORTED, "The run was aborted.", Usage.EMPTY, null, now);
+        StepOutcome closed = close(ready.state().toBuilder(), now);
+        var events = new ArrayList<>(ready.events());
+        events.addAll(closed.events());
+        return new StepOutcome.Finished(events, closed.state());
+    }
+
+    /// The single exit: unfilled slots are padded with `action was not executed`, then `TurnEnd`
+    /// carries exactly the index-aligned results.
+    private static StepOutcome close(TurnState.Builder b, Instant now) {
+        var events = new ArrayList<AgentEvent>();
+        List<ContentBlock.ToolCall> calls = b.assistant == null ? List.of() : b.assistant.toolCalls();
+        for (int i = 0; i < calls.size(); i++) {
             if (b.slots.get(i).isPresent()) continue;
             var call = calls.get(i);
             var pad = new ToolResultMessage(call.id(), call.name(), List.of(ContentBlock.Text.of(ToolMessages.NOT_EXECUTED)),
                     Json.Null.NULL, true, now);
             b.slots.set(i, Optional.of(pad));
-            padded.add(new AgentEvent.MessageStart(s.runId(), s.index(), now, pad));
-            padded.add(new AgentEvent.MessageEnd(s.runId(), s.index(), now, pad));
+            events.add(new AgentEvent.MessageStart(b.runId, b.index, now, pad));
+            events.add(new AgentEvent.MessageEnd(b.runId, b.index, now, pad));
         }
-        return close(b, padded, now);
-    }
-
-    /// The single exit: `TurnEnd` carries exactly the index-aligned results.
-    private static StepOutcome close(TurnState.Builder b, List<AgentEvent> before, Instant now) {
         b.phase = TurnPhase.CLOSED;
         TurnState next = b.build();
-        var events = new ArrayList<>(before);
         events.add(new AgentEvent.TurnEnd(next.runId(), next.index(), now, next.assistant(), next.results()));
         return new StepOutcome.Finished(events, next);
-    }
-
-    // ---- helpers -------------------------------------------------------------------------------
-
-    private static StepOutcome needs(TurnState.Builder b, List<AgentEvent> events, TurnPhase phase, Need need) {
-        b.phase = phase;
-        return new StepOutcome.Needs(events, b.build(), need);
     }
 
     private static StepOutcome ignored(TurnState s, StepInput in) {

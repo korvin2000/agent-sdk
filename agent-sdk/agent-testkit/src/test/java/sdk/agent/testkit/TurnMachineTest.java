@@ -12,6 +12,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.OptionalInt;
+import java.util.Set;
 
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -28,6 +29,7 @@ import sdk.agent.provider.LlmRequest;
 import sdk.agent.provider.LlmStreamEvent;
 import sdk.agent.provider.ThinkingLevel;
 import sdk.agent.tool.ToolMessages;
+import sdk.agent.tool.ToolSpec;
 import sdk.agent.turn.Need;
 import sdk.agent.turn.StepInput;
 import sdk.agent.turn.StepOutcome;
@@ -37,7 +39,7 @@ import sdk.agent.turn.TurnState;
 
 /// The turn machine driven entirely by hand-written [StepInput] sequences. No
 /// provider, no filesystem, no threads and no clock — `step` takes the instant explicitly — so
-/// every claim about ordering and about the stale-snapshot rule is checkable before a thread exists.
+/// every claim about ordering, padding and argument assembly is checkable before a thread exists.
 @DisplayName("TurnMachine (pure, no I/O)")
 final class TurnMachineTest {
 
@@ -100,11 +102,20 @@ final class TurnMachineTest {
                 "Cancel on a closed turn is a no-op, not a second TurnEnd");
     }
 
-    // ---- the stale-snapshot rule (Appendix B, 10 / 11 / 12) ------------------------------------
+    @Test
+    @DisplayName("Begin captures the advertised tools as the turn's execution authority")
+    void beginCapturesTheAdvertisedTools() {
+        var read = FakeTool.readOnly("read", "contents");
+        TurnState requested = drive(opening(), new StepInput.Begin(REQUEST.withTools(List.of(ToolSpec.of(read)))));
+        assertEquals(Set.of("read"), requested.allowedTools());
+        assertEquals(Set.of(), opening().allowedTools(), "nothing is allowed before a request exists");
+    }
+
+    // ---- argument assembly (Appendix B, 10 / 11 / 12) --------------------------------------------
 
     @Test
-    @DisplayName("12: a stalled stream suppresses the initialArguments fallback (ARGS_CUT_OFF_BY_STALL)")
-    void scenario12StaleSnapshotIsSuppressedWhenStalled() {
+    @DisplayName("12: a stall is a failed turn; malformed fragments never fall back to the stale snapshot")
+    void scenario12StallIsAFailedTurnAndTheSnapshotIsNeverUsed() {
         TurnState state = drive(opening(),
                 new StepInput.Begin(REQUEST),
                 new StepInput.StreamOpened(),
@@ -113,57 +124,59 @@ final class TurnMachineTest {
                 chunk(new LlmStreamEvent.ToolCallDelta(0, "{\"path\": \"/tmp/fresh.txt\", \"content\": \"replace", true)),
                 new StepInput.IdleTimedOut());
 
-        assertTrue(state.stalled(), "an idle timeout marks the turn stalled");
         ContentBlock.ToolCall call = state.assistant().toolCalls().getFirst();
         assertAll(
-                () -> assertSame(Json.Null.NULL, call.arguments(),
-                        "the truncated call must carry Json.Null, never the stale snapshot"),
-                () -> assertEquals(ToolMessages.ARGS_CUT_OFF_BY_STALL, state.preflight().get("call-1")),
-                () -> assertEquals(StopReason.TOOL_USE, state.assistant().stopReason()));
+                () -> assertEquals(StopReason.ERROR, state.assistant().stopReason(), "a stall ends the turn as an error"),
+                () -> assertEquals(TurnMachine.STALLED, state.assistant().errorMessage()),
+                () -> assertSame(Json.Null.NULL, call.arguments(), "the truncated call must carry Json.Null, never the stale snapshot"),
+                () -> assertEquals(1, state.slots().size(), "one slot per call, sized when the assistant is final"));
     }
 
     @Test
-    @DisplayName("11: unparseable, not stalled, no snapshot → ARGS_INVALID_JSON")
-    void scenario11UnparseableWithoutSnapshot() {
-        TurnState state = drive(opening(),
-                new StepInput.Begin(REQUEST),
-                new StepInput.StreamOpened(),
+    @DisplayName("11: unparseable fragments become Json.Null, with or without a start snapshot")
+    void scenario11UnparseableFragmentsAreNull() {
+        TurnState noSnapshot = drive(opening(),
+                new StepInput.Begin(REQUEST), new StepInput.StreamOpened(),
                 chunk(new LlmStreamEvent.ToolCallStart(0, "call-1", "write", Json.Obj.EMPTY)),
                 chunk(new LlmStreamEvent.ToolCallDelta(0, "{\"path\": \"/tmp/test.txt\", \"content\": \"incomplete", false)),
                 chunk(new LlmStreamEvent.Done(StopReason.TOOL_USE, Usage.EMPTY, "r")));
+        assertSame(Json.Null.NULL, noSnapshot.assistant().toolCalls().getFirst().arguments());
 
-        assertTrue(!state.stalled(), "a clean Done does not stall the turn");
-        assertSame(Json.Null.NULL, state.assistant().toolCalls().getFirst().arguments());
-        assertEquals(ToolMessages.ARGS_INVALID_JSON, state.preflight().get("call-1"));
-    }
-
-    @Test
-    @DisplayName("11b: unparseable, not stalled, WITH a snapshot → the snapshot is used")
-    void scenario11UnparseableWithSnapshotFallsBack() {
-        TurnState state = drive(opening(),
-                new StepInput.Begin(REQUEST),
-                new StepInput.StreamOpened(),
+        TurnState withSnapshot = drive(opening(),
+                new StepInput.Begin(REQUEST), new StepInput.StreamOpened(),
                 chunk(new LlmStreamEvent.ToolCallStart(0, "call-1", "write", Json.obj("path", Json.str("/tmp/snap.txt")))),
                 chunk(new LlmStreamEvent.ToolCallDelta(0, "{\"path\": \"/tmp/tru", false)),
                 chunk(new LlmStreamEvent.Done(StopReason.TOOL_USE, Usage.EMPTY, "r")));
-
-        assertEquals(Json.obj("path", Json.str("/tmp/snap.txt")), state.assistant().toolCalls().getFirst().arguments());
-        assertTrue(state.preflight().isEmpty(), "a usable fallback records no preflight problem");
+        assertSame(Json.Null.NULL, withSnapshot.assistant().toolCalls().getFirst().arguments(),
+                "received fragments are authoritative; a snapshot never masks a broken delta stream");
     }
 
     @Test
-    @DisplayName("10: a stall with valid JSON leaves the call usable")
-    void scenario10StallWithValidJsonIsUsable() {
+    @DisplayName("a call with no fragments at all uses the start snapshot (a provider that sends arguments whole)")
+    void noFragmentsUseTheSnapshot() {
         TurnState state = drive(opening(),
-                new StepInput.Begin(REQUEST),
-                new StepInput.StreamOpened(),
+                new StepInput.Begin(REQUEST), new StepInput.StreamOpened(),
+                chunk(new LlmStreamEvent.ToolCallStart(0, "call-1", "read", Json.obj("path", Json.str("whole.txt")))),
+                chunk(new LlmStreamEvent.Done(StopReason.TOOL_USE, Usage.EMPTY, "r")));
+
+        assertEquals(Json.obj("path", Json.str("whole.txt")), state.assistant().toolCalls().getFirst().arguments());
+    }
+
+    @Test
+    @DisplayName("10: a stall with valid JSON keeps the call for diagnosis but Proceed runs nothing")
+    void scenario10StallWithValidJsonNeverExecutes() {
+        TurnState state = drive(opening(),
+                new StepInput.Begin(REQUEST), new StepInput.StreamOpened(),
                 chunk(new LlmStreamEvent.ToolCallStart(0, "call-1", "read", Json.Obj.EMPTY)),
                 chunk(new LlmStreamEvent.ToolCallDelta(0, "{\"path\":\"file.txt\"}", false)),
                 new StepInput.IdleTimedOut());
 
-        assertTrue(state.stalled());
+        assertTrue(state.assistant().terminal());
         assertEquals(Json.obj("path", Json.str("file.txt")), state.assistant().toolCalls().getFirst().arguments());
-        assertTrue(state.preflight().isEmpty(), "valid JSON is usable even after a stall");
+
+        StepOutcome out = machine.step(state, new StepInput.Verdict(TurnVerdict.PROCEED), NOW);
+        assertInstanceOf(StepOutcome.Finished.class, out, "a failed turn closes instead of requesting tools");
+        assertEquals(ToolMessages.NOT_EXECUTED, ((AgentEvent.TurnEnd) out.events().getLast()).toolResults().getFirst().text());
     }
 
     @Test
@@ -201,6 +214,7 @@ final class TurnMachineTest {
                              new ContentBlock.Text("Hello, world!", null)),
                 thenThink.assistant().content(),
                 "the blank block must be dropped and the order must be THINK then TEXT");
+        assertTrue(thenThink.content().isEmpty(), "the accumulator is empty once the assistant is final");
 
         events.clear();
         TurnState thenText = drive(opening(),
@@ -231,7 +245,6 @@ final class TurnMachineTest {
 
         assertEquals(Json.obj("path", Json.str("/tmp/x.txt"), "content", Json.str("hi")),
                 state.assistant().toolCalls().getFirst().arguments());
-        assertTrue(state.preflight().isEmpty());
     }
 
     @Test
@@ -316,17 +329,20 @@ final class TurnMachineTest {
     }
 
     @Test
-    @DisplayName("a Stop or Retry verdict closes the turn with no tool results, however many calls it carried")
-    void verdictShortCircuitsTools() {
+    @DisplayName("Stop and Retry pad every call before TurnEnd — a refused turn still owes one result per call")
+    void stopAndRetryPadEveryCall() {
         TurnState ready = twoCallTurnReady();
-        events.clear();
 
-        StepOutcome stop = machine.step(ready, new StepInput.Verdict(
-                new TurnVerdict.Stop(new sdk.agent.event.RunOutcome.Aborted(), null)), NOW);
+        StepOutcome stop = machine.step(ready, new StepInput.Verdict(new TurnVerdict.Stop(new sdk.agent.event.RunOutcome.Aborted(), null)), NOW);
         assertInstanceOf(StepOutcome.Finished.class, stop);
+        assertEquals(List.of("MessageStart", "MessageEnd", "MessageStart", "MessageEnd", "TurnEnd"), trace(stop.events()));
         var turnEnd = (AgentEvent.TurnEnd) stop.events().getLast();
-        assertTrue(turnEnd.toolResults().isEmpty(), "a refused turn runs nothing, so it reports nothing");
-        assertEquals(2, turnEnd.message().toolCalls().size());
+        assertEquals(List.of("call-1", "call-2"), turnEnd.toolResults().stream().map(ToolResultMessage::toolCallId).toList());
+        assertTrue(turnEnd.toolResults().stream().allMatch(r -> r.isError() && r.text().equals(ToolMessages.NOT_EXECUTED)));
+
+        StepOutcome retry = machine.step(ready, new StepInput.Verdict(
+                new TurnVerdict.Retry(sdk.agent.message.UserMessage.text("retry", NOW), "policy")), NOW);
+        assertEquals(2, ((AgentEvent.TurnEnd) retry.events().getLast()).toolResults().size());
     }
 
     @Test
@@ -347,7 +363,21 @@ final class TurnMachineTest {
     }
 
     @Test
-    @DisplayName("Cancel before the assistant is final produces an ABORTED assistant message")
+    @DisplayName("a failed turn that collected calls never requests tools, whatever the verdict")
+    void aFailedTurnNeverRequestsTools() {
+        TurnState failed = drive(opening(),
+                new StepInput.Begin(REQUEST), new StepInput.StreamOpened(),
+                chunk(new LlmStreamEvent.ToolCallStart(0, "call-1", "write", Json.Obj.EMPTY)),
+                chunk(new LlmStreamEvent.ToolCallDelta(0, "{\"path\":\"secret.txt\"}", false)),
+                chunk(new LlmStreamEvent.Failed(StopReason.ERROR, "connection reset")));
+
+        StepOutcome out = machine.step(failed, new StepInput.Verdict(TurnVerdict.PROCEED), NOW);
+        assertInstanceOf(StepOutcome.Finished.class, out);
+        assertEquals(1, ((AgentEvent.TurnEnd) out.events().getLast()).toolResults().size());
+    }
+
+    @Test
+    @DisplayName("Cancel before the assistant is final produces an ABORTED assistant message and closes the turn")
     void cancelWhileStreamingAbortsTheAssistant() {
         TurnState streaming = drive(opening(), new StepInput.Begin(REQUEST), new StepInput.StreamOpened(),
                 chunk(new LlmStreamEvent.TextStart(0)),
@@ -355,7 +385,8 @@ final class TurnMachineTest {
         events.clear();
 
         StepOutcome out = machine.step(streaming, new StepInput.Cancel(), NOW);
-        assertEquals(List.of("MessageEnd"), trace(out.events()));
+        assertEquals(List.of("MessageEnd", "TurnEnd"), trace(out.events()));
+        assertEquals(TurnPhase.CLOSED, out.state().phase());
         assertEquals(StopReason.ABORTED, out.state().assistant().stopReason());
         assertEquals("The run was aborted.", out.state().assistant().errorMessage());
         assertEquals("partial", out.state().assistant().text(), "the partial text is kept, once, at MessageEnd");
@@ -363,17 +394,17 @@ final class TurnMachineTest {
     }
 
     @Test
-    @DisplayName("Cancel before the stream opens still brackets the turn: TurnStart, MessageStart, MessageEnd")
+    @DisplayName("Cancel before the stream opens still brackets the turn: TurnStart, MessageStart, MessageEnd, TurnEnd")
     void cancelBeforeTheStreamOpensStillBracketsTheTurn() {
         StepOutcome fromOpening = machine.step(opening(), new StepInput.Cancel(), NOW);
-        assertEquals(List.of("TurnStart", "MessageStart", "MessageEnd"), trace(fromOpening.events()),
+        assertEquals(List.of("TurnStart", "MessageStart", "MessageEnd", "TurnEnd"), trace(fromOpening.events()),
                 "I3 and I8 must hold on the abort path too, even when nothing was ever emitted");
         assertEquals(StopReason.ABORTED, fromOpening.state().assistant().stopReason());
 
         TurnState requested = drive(opening(), new StepInput.Begin(REQUEST));
         events.clear();
         StepOutcome fromRequested = machine.step(requested, new StepInput.Cancel(), NOW);
-        assertEquals(List.of("MessageStart", "MessageEnd"), trace(fromRequested.events()),
+        assertEquals(List.of("MessageStart", "MessageEnd", "TurnEnd"), trace(fromRequested.events()),
                 "TurnStart was already emitted by Begin; the message pair is still owed");
     }
 

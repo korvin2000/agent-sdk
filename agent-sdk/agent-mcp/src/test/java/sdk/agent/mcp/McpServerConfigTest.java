@@ -84,6 +84,13 @@ class McpServerConfigTest {
         assertThrows(IllegalArgumentException.class, () -> McpServerConfig.Http.of("s", URI.create("mcp")));
     }
 
+    @Test
+    void anHttpUrlRejectsOtherSchemesUserInfoAndFragments() {
+        assertThrows(IllegalArgumentException.class, () -> McpServerConfig.Http.of("s", URI.create("ftp://host/mcp")));
+        assertThrows(IllegalArgumentException.class, () -> McpServerConfig.Http.of("s", URI.create("https://user@host/mcp")));
+        assertThrows(IllegalArgumentException.class, () -> McpServerConfig.Http.of("s", URI.create("https://host/mcp#fragment")));
+    }
+
     /// The transport is the type, so a `switch` over the config needs no `default`.
     @Test
     void theSealedHierarchyIsExhaustiveWithoutADefaultArm() {

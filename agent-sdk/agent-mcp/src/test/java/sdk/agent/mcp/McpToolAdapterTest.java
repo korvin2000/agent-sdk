@@ -1,6 +1,7 @@
 package sdk.agent.mcp;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -12,8 +13,10 @@ import org.junit.jupiter.api.Test;
 import io.modelcontextprotocol.spec.McpSchema;
 import sdk.agent.concurrent.Cancellation;
 import sdk.agent.json.Json;
+import sdk.agent.tool.ErrorKind;
 import sdk.agent.tool.ToolInvocation;
 import sdk.agent.tool.ToolKind;
+import sdk.agent.tool.ToolResult;
 
 class McpToolAdapterTest {
 
@@ -84,6 +87,18 @@ class McpToolAdapterTest {
 
         assertEquals(List.of(new StubCaller.Call("list_files", arguments)), caller.calls);
         assertTrue(result.text().contains("stub"));
+    }
+
+    @Test
+    void nonObjectArgumentsAreRejectedBeforeTheRemoteCall() throws Exception {
+        var caller = new StubCaller("srv");
+        var adapter = new McpToolAdapter(caller, remote("probe", Json.Obj.EMPTY, null));
+
+        var result = adapter.execute(new ToolInvocation<>("call-1", adapter.name(), Json.str("wrong"), Json.str("wrong"), Cancellation.create(), null));
+
+        assertEquals(ErrorKind.INVALID_ARGUMENTS, assertInstanceOf(ToolResult.Err.class, result).kind());
+        assertEquals(McpToolAdapter.NOT_AN_OBJECT, result.text());
+        assertTrue(caller.calls.isEmpty());
     }
 
     private static McpToolAdapter adapter(String server, McpSchema.Tool remote) {

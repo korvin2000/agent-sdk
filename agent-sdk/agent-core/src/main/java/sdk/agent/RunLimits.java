@@ -4,9 +4,10 @@ import java.time.Duration;
 import java.util.Objects;
 import java.util.Optional;
 
-/// Every field is enforced at a named checkpoint in the engine; none is decoration. `maxTurns` is
-/// checked by `TurnGuard` (a policy about model behaviour), `maxToolCalls` before a batch launches,
-/// `wallClock` at the five abort checkpoints.
+/// Every field is enforced by the engine; none is decoration. `maxTurns` is checked before a turn
+/// opens (and, earlier, by `TurnGuard` as a policy about model behaviour), `maxToolCalls` before a
+/// batch launches, `wallClock` at every checkpoint and, through a deadline timer, while a row
+/// blocks in provider, hook or tool work.
 public record RunLimits(int maxTurns, int maxToolCalls, Optional<Duration> wallClock, ToolExecutionMode toolExecution) {
 
     public static final RunLimits DEFAULTS = new RunLimits(100, Integer.MAX_VALUE, Optional.empty(), ToolExecutionMode.PARALLEL);
@@ -15,6 +16,7 @@ public record RunLimits(int maxTurns, int maxToolCalls, Optional<Duration> wallC
         if (maxTurns < 1) throw new IllegalArgumentException("maxTurns must be >= 1, was " + maxTurns);
         if (maxToolCalls < 0) throw new IllegalArgumentException("maxToolCalls must be >= 0, was " + maxToolCalls);
         wallClock = Objects.requireNonNullElse(wallClock, Optional.empty());
+        if (wallClock.filter(d -> !d.isPositive()).isPresent()) throw new IllegalArgumentException("wallClock must be positive, was " + wallClock.get());
         toolExecution = Objects.requireNonNullElse(toolExecution, ToolExecutionMode.PARALLEL);
     }
 

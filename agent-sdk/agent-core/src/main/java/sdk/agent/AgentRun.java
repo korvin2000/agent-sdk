@@ -31,8 +31,9 @@ public final class AgentRun {
     /// and never exceptionally: a failure is a [sdk.agent.event.RunOutcome], not a thrown exception.
     public CompletableFuture<RunResult> result() { return result; }
 
-    /// This run's slice of the event stream: bounded, blocking, single-consumer, ends after `RunEnd`.
-    /// Events emitted before the first pull are buffered (the newest 256 are kept if nobody reads).
+    /// This run's slice of the event stream: single-consumer, blocking, ends after `RunEnd`. It is
+    /// lossy by design — the newest 256 events are kept and a consumer that stops reading never
+    /// stalls the run; [#result] and the transcript are authoritative.
     public Stream<AgentEvent> events() { return events.stream(); }
 
     /// The last durable checkpoint.

@@ -23,14 +23,12 @@ final class McpJsonBridge {
 
     private McpJsonBridge() { }
 
-    /// The `arguments` shape `CallToolRequest` wants. A non-object (the model sent a bare array or
-    /// string) becomes an empty map rather than an exception — the remote server is the authority
-    /// on its own schema and reports the mismatch itself.
+    /// The `arguments` shape `CallToolRequest` wants. MCP arguments are an object by definition;
+    /// silently sending an empty map for a scalar or array would discard what the model supplied.
     static Map<String, Object> toMap(Json json) {
+        if (!(json instanceof Json.Obj obj)) throw new IllegalArgumentException(McpToolAdapter.NOT_AN_OBJECT);
         var out = new LinkedHashMap<String, Object>();
-        if (json instanceof Json.Obj obj) {
-            obj.members().forEach((k, v) -> out.put(k, toSdk(v)));
-        }
+        obj.members().forEach((k, v) -> out.put(k, toSdk(v)));
         return out;
     }
 

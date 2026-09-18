@@ -69,7 +69,7 @@ class McpStdioIntegrationTest {
 
     @Test
     void discoversAndNamespacesEveryToolTheServerAdvertises() {
-        assertEquals(List.of("mcp__echo_srv__echo", "mcp__echo_srv__boom", "mcp__echo_srv__cwd"),
+        assertEquals(List.of("mcp__echo_srv__echo", "mcp__echo_srv__boom", "mcp__echo_srv__cwd", "mcp__echo_srv__structured"),
                 new ArrayList<>(tools.keySet()));
         assertEquals("[MCP:echo_srv] Returns its argument, after an optional delay.",
                 tools.get("mcp__echo_srv__echo").description());
@@ -101,10 +101,20 @@ class McpStdioIntegrationTest {
         ToolResult result = call("mcp__echo_srv__echo", Json.obj("text", Json.str("ping")));
 
         assertInstanceOf(ToolResult.Ok.class, result);
-        assertEquals(2, result.content().size());
+        assertEquals(3, result.content().size());
         assertEquals(new ContentBlock.Text("ping", null), result.content().get(0));
         assertEquals(new ContentBlock.Image("QUJD", "image/png"), result.content().get(1));
+        assertEquals(new ContentBlock.Text("{\"length\":4}", null), result.content().get(2), "structured content is visible to the model too");
         assertEquals(Json.obj("length", Json.num(4)), result.details());
+    }
+
+    @Test
+    void aStructuredOnlyResultIsStillVisibleToTheModel() throws Exception {
+        ToolResult result = call("mcp__echo_srv__structured", Json.Obj.EMPTY);
+
+        assertInstanceOf(ToolResult.Ok.class, result);
+        assertEquals(List.of(new ContentBlock.Text("{\"answer\":42}", null)), result.content());
+        assertEquals(Json.obj("answer", Json.num(42)), result.details());
     }
 
     @Test
@@ -136,7 +146,7 @@ class McpStdioIntegrationTest {
 
         ToolResult after = call("mcp__echo_srv__echo", Json.obj("text", Json.str("still here")));
         assertInstanceOf(ToolResult.Ok.class, after);
-        assertEquals("still here", ContentBlock.textOf(after.content()));
+        assertEquals(new ContentBlock.Text("still here", null), after.content().getFirst());
     }
 
     @SuppressWarnings("unchecked")

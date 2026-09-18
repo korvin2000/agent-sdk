@@ -97,6 +97,32 @@ class McpContentMapperTest {
                 mapper.map(new McpSchema.CallToolResult(List.of(), null, null, null)).details());
     }
 
+    @Test
+    void structuredOnlyResultsAreVisibleToTheModelAsCanonicalJson() {
+        ToolResult mapped = mapper.map(new McpSchema.CallToolResult(List.of(), false, Map.of("answer", 42), null));
+
+        assertEquals(List.of(new ContentBlock.Text("{\"answer\":42}", null)), mapped.content());
+        assertEquals(Json.obj("answer", Json.num(42)), mapped.details());
+    }
+
+    @Test
+    void structuredContentIsAppendedOnceAndNeverDuplicatesAnExactTextBlock() {
+        var structured = Map.of("answer", 42);
+        var summary = mapper.map(new McpSchema.CallToolResult(List.of(McpSchema.TextContent.builder("summary").build()), false, structured, null));
+        var exact = mapper.map(new McpSchema.CallToolResult(List.of(McpSchema.TextContent.builder("{\"answer\":42}").build()), false, structured, null));
+
+        assertEquals(List.of(new ContentBlock.Text("summary", null), new ContentBlock.Text("{\"answer\":42}", null)), summary.content());
+        assertEquals(List.of(new ContentBlock.Text("{\"answer\":42}", null)), exact.content());
+    }
+
+    @Test
+    void structuredContentStaysVisibleWhenTheServerReportsAnError() {
+        ToolResult mapped = mapper.map(new McpSchema.CallToolResult(List.of(), true, Map.of("errorCode", "E42"), null));
+
+        assertEquals(ErrorKind.TOOL_REPORTED, assertInstanceOf(ToolResult.Err.class, mapped).kind());
+        assertEquals("{\"errorCode\":\"E42\"}", mapped.text());
+    }
+
     /// `McpSchema.Content` is not sealed, so a foreign implementation is reachable. It must
     /// degrade **visibly** — the model still sees that a block existed and what kind it was.
     @Test

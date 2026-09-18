@@ -3,11 +3,14 @@ package sdk.agent;
 import java.net.URI;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.format.DateTimeParseException;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.function.Function;
+import java.util.stream.Collectors;
 
 import sdk.agent.event.RunOutcome;
 import sdk.agent.json.Json;
@@ -28,14 +31,14 @@ import sdk.agent.turn.TurnState;
 /// fresh collaborators. The three built-in message kinds are encoded here; every other kind goes
 /// through its registered [AgentMessageCodec]. Encode is **fail-closed** — an unregistered kind
 /// throws naming the class — while decode keeps an unknown kind as an opaque [CustomMessage] so
-/// nothing is ever dropped. `RunOutcome.Failed.cause` does not survive the round trip.
+/// nothing is ever dropped. Decode is strict: a missing or mistyped member throws naming it, never
+/// silently defaults. `RunOutcome.Failed.cause` does not survive the round trip.
 ///
-/// A checkpoint never falls inside a provider stream, so a turn's streaming accumulator (open
-/// block, partial tool-call arguments) is always empty and is not written; `content` is the
-/// finished assistant message's content.
+/// A checkpoint never falls inside a provider stream, so a turn's streaming accumulator is empty
+/// and is not written; encoding a streaming turn is refused rather than lossy.
 public final class RunStateCodec {
 
-    public static final int SCHEMA_VERSION = 2;
+    public static final int SCHEMA_VERSION = 3;
 
     private final Map<String, AgentMessageCodec> custom;
 
@@ -73,17 +76,17 @@ public final class RunStateCodec {
         }
         return new RunState(
                 str(o, "runId"),
-                Phase.valueOf(str(o, "phase")),
+                enumOf(Phase.class, str(o, "phase")),
                 num(o, "turnIndex").asInt(),
                 messages(arr(o, "transcript")),
                 num(o, "seedSize").asInt(),
                 messages(arr(o, "pendingInjection")),
                 nullable(o, "turn", this::decodeTurn),
-                decodeLimits(obj(o.get("limits").orElseThrow(), "limits")),
+                decodeLimits(obj(member(o, "limits"), "limits")),
                 num(o, "turnsUsed").asInt(),
                 num(o, "toolCallsUsed").asInt(),
-                decodeUsage(obj(o.get("usage").orElseThrow(), "usage")),
-                Instant.parse(str(o, "startedAt")),
+                decodeUsage(obj(member(o, "usage"), "usage")),
+                instant(o, "startedAt"),
                 nullable(o, "outcome", this::decodeOutcome),
                 optStr(o, "toolSetHash"));
     }
@@ -116,15 +119,15 @@ public final class RunStateCodec {
     public AgentMessage decodeMessage(Json json) {
         Json.Obj env = obj(json, "message");
         String kind = str(env, "kind");
-        Instant at = Instant.parse(str(env, "at"));
-        Json data = env.get("data").orElse(Json.Obj.EMPTY);
+        Instant at = instant(env, "at");
+        Json data = member(env, "data");
         return switch (kind) {
             case "user"       -> new UserMessage(decodeBlocks(arr(obj(data, "user"), "content")), at);
             case "assistant"  -> decodeAssistant(obj(data, "assistant"), at);
             case "toolResult" -> {
                 Json.Obj o = obj(data, "toolResult");
                 yield new ToolResultMessage(str(o, "toolCallId"), str(o, "toolName"), decodeBlocks(arr(o, "content")),
-                        o.get("details").orElse(Json.Null.NULL), bool(o, "isError"), at);
+                        member(o, "details"), bool(o, "isError"), at);
             }
             default -> {
                 AgentMessageCodec codec = custom.get(kind);
@@ -149,9 +152,9 @@ public final class RunStateCodec {
     }
 
     private AssistantMessage decodeAssistant(Json.Obj o, Instant at) {
-        return new AssistantMessage(decodeBlocks(arr(o, "content")), decodeModel(obj(o.get("model").orElseThrow(), "model")),
-                optStr(o, "responseId"), decodeUsage(obj(o.get("usage").orElseThrow(), "usage")),
-                StopReason.valueOf(str(o, "stopReason")), optStr(o, "errorMessage"), at);
+        return new AssistantMessage(decodeBlocks(arr(o, "content")), decodeModel(obj(member(o, "model"), "model")),
+                optStr(o, "responseId"), decodeUsage(obj(member(o, "usage"), "usage")),
+                enumOf(StopReason.class, str(o, "stopReason")), optStr(o, "errorMessage"), at);
     }
 
     // ---- content blocks ------------------------------------------------------------------------
@@ -181,7 +184,7 @@ public final class RunStateCodec {
             case "audio"     -> new ContentBlock.Audio(str(o, "data"), str(o, "mimeType"));
             case "resource"  -> new ContentBlock.Resource(URI.create(str(o, "uri")), optStr(o, "mimeType"),
                                     Optional.ofNullable(optStr(o, "text")), Optional.ofNullable(optStr(o, "blob")));
-            case "tool_call" -> new ContentBlock.ToolCall(str(o, "id"), str(o, "name"), o.get("arguments").orElse(Json.Obj.EMPTY), optStr(o, "thoughtSignature"));
+            case "tool_call" -> new ContentBlock.ToolCall(str(o, "id"), str(o, "name"), member(o, "arguments"), optStr(o, "thoughtSignature"));
             default          -> throw new IllegalArgumentException("unknown content block type '" + str(o, "type") + "'");
         };
     }
@@ -192,33 +195,34 @@ public final class RunStateCodec {
 
     // ---- turn state ----------------------------------------------------------------------------
 
+    /// @throws IllegalStateException for a turn still streaming — its accumulator has no durable form
     public Json encode(TurnState t) {
+        if (t.phase() == TurnPhase.STREAM_REQUESTED || t.phase() == TurnPhase.STREAMING) {
+            throw new IllegalStateException("a turn cannot be checkpointed while streaming (" + t.phase() + ")");
+        }
         var m = new LinkedHashMap<String, Json>();
         m.put("runId", Json.str(t.runId()));
         m.put("index", Json.num(t.index()));
         m.put("phase", Json.str(t.phase().name()));
         m.put("model", encode(t.model()));
-        var preflight = new LinkedHashMap<String, Json>();
-        t.preflight().forEach((id, text) -> preflight.put(id, Json.str(text)));
-        m.put("preflight", Json.obj(preflight));
+        m.put("allowedTools", Json.arr(t.allowedTools().stream().sorted().map(Json::str).toList()));
         m.put("assistant", t.assistant() == null ? Json.nil() : encodeMessage(t.assistant()));
         m.put("slots", Json.arr(t.slots().stream().map(s -> s.<Json>map(this::encodeMessage).orElse(Json.Null.NULL)).toList()));
-        m.put("stalled", Json.bool(t.stalled()));
         return Json.obj(m);
     }
 
     private TurnState decodeTurn(Json json) {
         Json.Obj o = obj(json, "turn state");
-        var preflight = new LinkedHashMap<String, String>();
-        obj(o.get("preflight").orElse(Json.Obj.EMPTY), "preflight").members().forEach((k, v) -> preflight.put(k, ((Json.Str) v).value()));
+        Set<String> allowedTools = arr(o, "allowedTools").values().stream()
+                .map(v -> v instanceof Json.Str s ? s.value() : RunStateCodec.<String>wrong("allowedTools", "string array"))
+                .collect(Collectors.toSet());
         AssistantMessage assistant = nullable(o, "assistant", j -> (AssistantMessage) decodeMessage(j));
         List<Optional<ToolResultMessage>> slots = arr(o, "slots").values().stream()
                 .map(s -> s == Json.Null.NULL ? Optional.<ToolResultMessage>empty() : Optional.of((ToolResultMessage) decodeMessage(s)))
                 .toList();
-        return new TurnState(str(o, "runId"), num(o, "index").asInt(), TurnPhase.valueOf(str(o, "phase")),
-                decodeModel(obj(o.get("model").orElseThrow(), "model")),
-                assistant == null ? List.of() : assistant.content(), Optional.empty(), new LinkedHashMap<>(),
-                preflight, assistant, slots, bool(o, "stalled"));
+        return new TurnState(str(o, "runId"), num(o, "index").asInt(), enumOf(TurnPhase.class, str(o, "phase")),
+                decodeModel(obj(member(o, "model"), "model")), List.of(), Optional.empty(), new LinkedHashMap<>(),
+                allowedTools, assistant, slots);
     }
 
     // ---- small records -------------------------------------------------------------------------
@@ -240,9 +244,8 @@ public final class RunStateCodec {
     }
 
     private static Usage decodeUsage(Json.Obj o) {
-        Json.Obj c = obj(o.get("cost").orElse(Json.Obj.EMPTY), "cost");
-        var cost = c.isEmpty() ? Usage.Cost.ZERO
-                : new Usage.Cost(num(c, "input").asDouble(), num(c, "output").asDouble(), num(c, "cacheRead").asDouble(), num(c, "cacheWrite").asDouble(), num(c, "total").asDouble());
+        Json.Obj c = obj(member(o, "cost"), "cost");
+        var cost = new Usage.Cost(num(c, "input").asDouble(), num(c, "output").asDouble(), num(c, "cacheRead").asDouble(), num(c, "cacheWrite").asDouble(), num(c, "total").asDouble());
         return new Usage(num(o, "input").asLong(), num(o, "output").asLong(), num(o, "cacheRead").asLong(), num(o, "cacheWrite").asLong(), num(o, "totalTokens").asLong(), cost);
     }
 
@@ -256,9 +259,9 @@ public final class RunStateCodec {
     }
 
     private static RunLimits decodeLimits(Json.Obj o) {
-        return new RunLimits(num(o, "maxTurns").asInt(), num(o, "maxToolCalls").asInt(),
-                o.get("wallClockMillis").map(v -> Duration.ofMillis(((Json.Num) v).asLong())),
-                ToolExecutionMode.valueOf(str(o, "toolExecution")));
+        Optional<Duration> wallClock = o.has("wallClockMillis") ? Optional.of(Duration.ofMillis(num(o, "wallClockMillis").asLong())) : Optional.empty();
+        return new RunLimits(num(o, "maxTurns").asInt(), num(o, "maxToolCalls").asInt(), wallClock,
+                enumOf(ToolExecutionMode.class, str(o, "toolExecution")));
     }
 
     private static Json encode(RunOutcome outcome) {
@@ -273,47 +276,60 @@ public final class RunStateCodec {
     private RunOutcome decodeOutcome(Json json) {
         Json.Obj o = obj(json, "outcome");
         return switch (str(o, "type")) {
-            case "completed"     -> new RunOutcome.Completed(StopReason.valueOf(str(o, "reason")));
+            case "completed"     -> new RunOutcome.Completed(enumOf(StopReason.class, str(o, "reason")));
             case "aborted"       -> new RunOutcome.Aborted();
-            case "failed"        -> new RunOutcome.Failed(StopReason.valueOf(str(o, "reason")), str(o, "message"), null);
-            case "limitExceeded" -> new RunOutcome.LimitExceeded(RunOutcome.Limit.valueOf(str(o, "limit")), str(o, "detail"));
+            case "failed"        -> new RunOutcome.Failed(enumOf(StopReason.class, str(o, "reason")), str(o, "message"), null);
+            case "limitExceeded" -> new RunOutcome.LimitExceeded(enumOf(RunOutcome.Limit.class, str(o, "limit")), str(o, "detail"));
             default              -> throw new IllegalArgumentException("unknown outcome type '" + str(o, "type") + "'");
         };
     }
 
-    // ---- accessors -----------------------------------------------------------------------------
+    // ---- strict accessors ----------------------------------------------------------------------
 
     private static void putIfPresent(Map<String, Json> m, String key, String value) { if (value != null) m.put(key, Json.str(value)); }
+
+    private static Json member(Json.Obj o, String key) {
+        return o.get(key).orElseThrow(() -> new IllegalArgumentException("missing member '" + key + "'"));
+    }
 
     private static Json.Obj obj(Json j, String what) {
         if (j instanceof Json.Obj o) return o;
         throw new IllegalArgumentException(what + " must be a JSON object, got " + j.getClass().getSimpleName());
     }
 
-    private static Json.Arr arr(Json.Obj o, String key) {
-        return o.get(key).filter(Json.Arr.class::isInstance).map(Json.Arr.class::cast).orElse(Json.Arr.EMPTY);
-    }
+    private static Json.Arr arr(Json.Obj o, String key)  { return member(o, key) instanceof Json.Arr a ? a : wrong(key, "array"); }
+    private static Json.Num num(Json.Obj o, String key)  { return member(o, key) instanceof Json.Num n ? n : wrong(key, "number"); }
+    private static String str(Json.Obj o, String key)    { return member(o, key) instanceof Json.Str s ? s.value() : wrong(key, "string"); }
+    private static boolean bool(Json.Obj o, String key)  { return member(o, key) instanceof Json.Bool b ? b.value() : wrong(key, "boolean"); }
 
-    private static String str(Json.Obj o, String key) {
-        String s = optStr(o, key);
-        if (s == null) throw new IllegalArgumentException("missing string member '" + key + "'");
-        return s;
-    }
-
+    /// Absent or `null` → `null`; anything else must be a string.
     private static String optStr(Json.Obj o, String key) {
-        return o.get(key).filter(Json.Str.class::isInstance).map(j -> ((Json.Str) j).value()).orElse(null);
+        Json v = o.get(key).orElse(Json.Null.NULL);
+        return v == Json.Null.NULL ? null : v instanceof Json.Str s ? s.value() : wrong(key, "string");
     }
 
-    private static Json.Num num(Json.Obj o, String key) {
-        return o.get(key).filter(Json.Num.class::isInstance).map(Json.Num.class::cast)
-                .orElseThrow(() -> new IllegalArgumentException("missing number member '" + key + "'"));
+    private static Instant instant(Json.Obj o, String key) {
+        try {
+            return Instant.parse(str(o, key));
+        } catch (DateTimeParseException e) {
+            throw new IllegalArgumentException("member '" + key + "' must be an ISO-8601 instant", e);
+        }
     }
 
-    private static boolean bool(Json.Obj o, String key) {
-        return o.get(key).filter(Json.Bool.class::isInstance).map(j -> ((Json.Bool) j).value()).orElse(false);
+    private static <E extends Enum<E>> E enumOf(Class<E> type, String value) {
+        try {
+            return Enum.valueOf(type, value);
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("unknown " + type.getSimpleName() + " '" + value + "'", e);
+        }
     }
 
     private static <T> T nullable(Json.Obj o, String key, Function<Json, T> decode) {
-        return o.get(key).filter(j -> j != Json.Null.NULL).map(decode).orElse(null);
+        Json v = member(o, key);
+        return v == Json.Null.NULL ? null : decode.apply(v);
+    }
+
+    private static <T> T wrong(String key, String type) {
+        throw new IllegalArgumentException("member '" + key + "' must be a JSON " + type);
     }
 }

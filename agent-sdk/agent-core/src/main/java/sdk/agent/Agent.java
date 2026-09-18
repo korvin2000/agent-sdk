@@ -39,7 +39,8 @@ import sdk.agent.turn.TurnMachine;
 
 /// The facade. Owns at most one live run, the two message queues, the listener fan-out and the
 /// transcript between runs. `abort()` clears both queues; `reset()` aborts and waits first;
-/// listener throws are isolated; late events never throw.
+/// listener throws are isolated; late events never throw. `close()` is idempotent and a closed
+/// agent refuses new runs and queued messages.
 public final class Agent implements AutoCloseable {
 
     /// Everything the builder decided, immutable.
@@ -69,6 +70,7 @@ public final class Agent implements AutoCloseable {
     private AgentRun active;                                // guarded by lock
     private AgentRun last;                                  // guarded by lock
     private CompletableFuture<Void> idle = CompletableFuture.completedFuture(null);   // guarded by lock
+    private boolean closed;                                 // guarded by lock
 
     Agent(Config cfg, ListenerFanout fanout) {
         this.cfg = Objects.requireNonNull(cfg);
@@ -117,6 +119,7 @@ public final class Agent implements AutoCloseable {
 
     private AgentRun launch(RunState initial, ToolRegistry tools) {
         synchronized (lock) {
+            ensureOpen();
             if (active != null) throw new IllegalStateException("a run is already active: " + active.runId());
             var cancel = Cancellation.create();
             var queue = new QueueSink();
@@ -192,9 +195,13 @@ public final class Agent implements AutoCloseable {
 
     // ---- control -------------------------------------------------------------------------------
 
-    public void steer(AgentMessage message) { steering.push(message); }
+    public void steer(AgentMessage message) {
+        synchronized (lock) { ensureOpen(); steering.push(message); }
+    }
 
-    public void followUp(AgentMessage message) { followUps.push(message); }
+    public void followUp(AgentMessage message) {
+        synchronized (lock) { ensureOpen(); followUps.push(message); }
+    }
 
     /// Returns without waiting; [#waitForIdle] is how you learn it stopped. Also clears both queues.
     public void abort() {
@@ -211,17 +218,24 @@ public final class Agent implements AutoCloseable {
 
     /// Aborts, waits, then clears the transcript and both queues.
     public void reset() {
+        synchronized (lock) { ensureOpen(); }
         abort();
         waitForIdle().join();
         synchronized (lock) { transcript = List.of(); last = null; }
     }
 
     /// Aborts any run, waits briefly, closes extensions in reverse order (a throw from one does not
-    /// stop the others) and releases the run executor.
+    /// stop the others) and releases the run executor. Idempotent.
     @Override public void close() {
+        synchronized (lock) {
+            if (closed) return;
+            closed = true;
+        }
         abort();
         try {
             waitForIdle().get(5, TimeUnit.SECONDS);
+        } catch (InterruptedException _) {
+            Thread.currentThread().interrupt();
         } catch (Exception _) {
             // an unresponsive run is abandoned; its RunEnd still fires when it notices the cancel
         }
@@ -229,5 +243,9 @@ public final class Agent implements AutoCloseable {
             try { e.close(); } catch (Exception ex) { LOG.log(System.Logger.Level.WARNING, "extension " + e.id() + " close threw", ex); }
         }
         runner.shutdownNow();
+    }
+
+    private void ensureOpen() {
+        if (closed) throw new IllegalStateException("agent is closed");
     }
 }

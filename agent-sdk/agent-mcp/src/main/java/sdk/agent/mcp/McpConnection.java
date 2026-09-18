@@ -3,6 +3,7 @@ package sdk.agent.mcp;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CancellationException;
@@ -68,6 +69,9 @@ final class McpConnection implements McpCaller, AutoCloseable {
     private volatile Health health = Health.LIVE;
     private volatile Runnable onToolsChanged = () -> { };
 
+    /// A client and the catalog discovered on it, so a reconnect publishes both or neither.
+    private record Connected(McpSyncClient client, List<McpSchema.Tool> tools) { }
+
     private McpConnection(McpServerConfig config, String server) {
         this.config = config;
         this.server = server;
@@ -81,7 +85,9 @@ final class McpConnection implements McpCaller, AutoCloseable {
         var connection = new McpConnection(Objects.requireNonNull(config, "config"),
                                            Objects.requireNonNull(server, "server"));
         try {
-            connection.client = connection.connectOnce();
+            Connected connected = connection.connectOnce();
+            connection.client = connected.client();
+            connection.tools = connected.tools();
             return connection;
         } catch (RuntimeException e) {
             connection.background.close();
@@ -127,7 +133,7 @@ final class McpConnection implements McpCaller, AutoCloseable {
             } catch (CancellationException _) {
                 return ToolResult.error(ErrorKind.CANCELLED, "MCP tool %s was cancelled.".formatted(remoteName));
             } catch (ExecutionException e) {
-                return failure(remoteName, e.getCause());
+                return failure(active, remoteName, e.getCause());
             }
         }
     }
@@ -136,13 +142,13 @@ final class McpConnection implements McpCaller, AutoCloseable {
     /// — an unknown tool, invalid params — and says nothing about the transport, so it becomes
     /// `TOOL_REPORTED` and leaves health alone. Anything else is infrastructure: `UNAVAILABLE`
     /// **plus** a health transition, so the next call fails fast instead of blocking.
-    private ToolResult failure(String remoteName, Throwable cause) {
+    private ToolResult failure(McpSyncClient active, String remoteName, Throwable cause) {
         McpError rpc = jsonRpcErrorIn(cause);
         if (rpc != null) {
             return ToolResult.error(ErrorKind.TOOL_REPORTED,
                     "MCP tool %s failed: %s".formatted(remoteName, describe(rpc)));
         }
-        markDegraded(cause);
+        markDegraded(active, cause);
         return ToolResult.error(ErrorKind.UNAVAILABLE,
                 "MCP server %s is unreachable: %s".formatted(server, describe(cause)));
     }
@@ -162,9 +168,11 @@ final class McpConnection implements McpCaller, AutoCloseable {
 
     // ---- health ----------------------------------------------------------------------------
 
-    private void markDegraded(Throwable cause) {
+    /// Only a fault on the **current** client degrades: a call that was in flight on the client a
+    /// reconnect just replaced must not knock the fresh one over.
+    private void markDegraded(McpSyncClient failed, Throwable cause) {
         synchronized (this) {
-            if (health != Health.LIVE) return;
+            if (health != Health.LIVE || client != failed) return;
             health = Health.DEGRADED;
         }
         LOG.log(System.Logger.Level.WARNING, "MCP server {0} degraded: {1}", server, describe(cause));
@@ -201,7 +209,7 @@ final class McpConnection implements McpCaller, AutoCloseable {
     }
 
     private boolean tryReconnect(int attempt) {
-        McpSyncClient replacement;
+        Connected replacement;
         try {
             replacement = connectOnce();
         } catch (RuntimeException e) {
@@ -212,11 +220,12 @@ final class McpConnection implements McpCaller, AutoCloseable {
         McpSyncClient previous;
         synchronized (this) {
             if (health == Health.CLOSED) {
-                closeQuietly(replacement);
+                closeQuietly(replacement.client());
                 return true;
             }
             previous = client;
-            client = replacement;
+            client = replacement.client();
+            tools = replacement.tools();
             health = Health.LIVE;
         }
         closeQuietly(previous);
@@ -227,7 +236,7 @@ final class McpConnection implements McpCaller, AutoCloseable {
 
     // ---- lifecycle -------------------------------------------------------------------------
 
-    private McpSyncClient connectOnce() {
+    private Connected connectOnce() {
         McpClientTransport transport = McpTransports.create(config);
         McpSyncClient candidate = McpClient.sync(transport)
                 .clientInfo(McpSchema.Implementation.builder(McpExtension.ID, CLIENT_VERSION).build())
@@ -241,16 +250,17 @@ final class McpConnection implements McpCaller, AutoCloseable {
         boolean handed = false;
         try {
             candidate.initialize();
-            this.tools = discover(candidate);
+            var connected = new Connected(candidate, discover(candidate));
             handed = true;
-            return candidate;
+            return connected;
         } finally {
             if (!handed) closeQuietly(candidate);
         }
     }
 
     /// Capability-gated: a server that never declares `tools` is not asked for a list, which is
-    /// one fewer doomed round trip per connect.
+    /// one fewer doomed round trip per connect. Pagination is bounded and a repeated cursor is an
+    /// error, so a partial catalog is never published as if it were complete.
     private List<McpSchema.Tool> discover(McpSyncClient active) {
         McpSchema.ServerCapabilities caps = active.getServerCapabilities();
         if (caps == null || caps.tools() == null) {
@@ -258,14 +268,16 @@ final class McpConnection implements McpCaller, AutoCloseable {
             return List.of();
         }
         var all = new ArrayList<McpSchema.Tool>();
+        var cursors = new HashSet<String>();
         String cursor = null;
-        for (int page = 0; page < MAX_LIST_PAGES; page++) {
+        for (int page = 1; ; page++) {
             McpSchema.ListToolsResult result = cursor == null ? active.listTools() : active.listTools(cursor);
             if (result.tools() != null) all.addAll(result.tools());
             cursor = result.nextCursor();
-            if (cursor == null || cursor.isEmpty()) break;
+            if (cursor == null || cursor.isEmpty()) return filter(all);
+            if (page == MAX_LIST_PAGES) throw new IllegalStateException("MCP server " + server + " tools/list exceeded " + MAX_LIST_PAGES + " pages");
+            if (!cursors.add(cursor)) throw new IllegalStateException("MCP server " + server + " tools/list repeated cursor: " + cursor);
         }
-        return filter(all);
     }
 
     private List<McpSchema.Tool> filter(List<McpSchema.Tool> raw) {
@@ -284,13 +296,19 @@ final class McpConnection implements McpCaller, AutoCloseable {
         onToolsChanged.run();
     }
 
+    /// The catalog is detached before anything is torn down, so a racing `list_changed` can
+    /// neither republish this server's tools nor reach the pool after it is gone.
     @Override public void close() {
+        McpSyncClient closing;
         synchronized (this) {
             if (health == Health.CLOSED) return;
             health = Health.CLOSED;
+            onToolsChanged = () -> { };
+            tools = List.of();
+            closing = client;
         }
         background.close();
-        closeQuietly(client);
+        closeQuietly(closing);
     }
 
     /// `McpSyncClient` is `AutoCloseable` with both `close()` (hands off to the async client, no

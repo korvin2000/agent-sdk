@@ -3,6 +3,7 @@ package sdk.agent.mcp;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.math.BigDecimal;
@@ -99,9 +100,9 @@ class McpJsonBridgeTest {
     }
 
     @Test
-    void aNonObjectArgumentBecomesAnEmptyMapRatherThanThrowing() {
-        assertEquals(Map.of(), McpJsonBridge.toMap(Json.str("not an object")));
-        assertEquals(Map.of(), McpJsonBridge.toMap(Json.Null.NULL));
+    void aNonObjectArgumentIsRejectedRatherThanSilentlyDiscarded() {
+        assertThrows(IllegalArgumentException.class, () -> McpJsonBridge.toMap(Json.str("not an object")));
+        assertThrows(IllegalArgumentException.class, () -> McpJsonBridge.toMap(Json.Null.NULL));
         assertEquals(Json.Obj.EMPTY, McpJsonBridge.toJsonObj(null));
     }
 }

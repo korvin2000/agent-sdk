@@ -1,6 +1,7 @@
 package sdk.agent.mcp;
 
 import java.net.URI;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -33,9 +34,18 @@ final class McpContentMapper {
         this.server = Objects.requireNonNull(server, "server");
     }
 
+    /// `structuredContent` is host-side `details`, but it must reach the model too: a server that
+    /// answers with structured content alone would otherwise produce `(no output)`. Its canonical
+    /// JSON is appended as text unless a text block already carries exactly that.
     ToolResult map(McpSchema.CallToolResult result) {
-        List<ContentBlock> blocks = result.content().stream().map(this::block).toList();
+        var blocks = new ArrayList<ContentBlock>(result.content().stream().map(this::block).toList());
         Json structured = McpJsonBridge.toJson(result.structuredContent());
+        if (result.structuredContent() != null) {
+            String canonical = structured.toText();
+            if (blocks.stream().noneMatch(b -> b instanceof ContentBlock.Text t && t.text().equals(canonical))) {
+                blocks.add(ContentBlock.Text.of(canonical));
+            }
+        }
         return Boolean.TRUE.equals(result.isError())
                 ? new ToolResult.Err(ErrorKind.TOOL_REPORTED, blocks, structured)
                 : new ToolResult.Ok(blocks, structured);

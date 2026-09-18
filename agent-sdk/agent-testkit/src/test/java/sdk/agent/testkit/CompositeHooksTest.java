@@ -3,7 +3,7 @@ package sdk.agent.testkit;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertSame;
-import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -39,9 +39,9 @@ import sdk.agent.tool.ErrorKind;
 import sdk.agent.tool.ToolRegistry;
 import sdk.agent.tool.ToolResult;
 
-/// Composition rules and the `safely` fallbacks: a throwing hook degrades to its
-/// stated fallback — "the rewrite did not apply", never "the tool call vanished".
-@DisplayName("CompositeHooks — composition and isolation")
+/// Composition rules and fail-closed decisions: a hook that throws or returns null is reported and
+/// the failure propagates — never a permissive fallback. Only event observation is isolated.
+@DisplayName("CompositeHooks — composition and fail-closed decisions")
 final class CompositeHooksTest {
 
     private static final ModelRef MODEL = new ModelRef("test", "scripted", "scripted-1", 200_000, 8_000);
@@ -98,23 +98,14 @@ final class CompositeHooksTest {
     }
 
     @Test
-    @DisplayName("a throwing transformContext degrades to its input; the chain continues")
-    void transformContextIsolatesAThrow() {
+    @DisplayName("a throwing transformContext is reported and propagates — the raw transcript is never sent")
+    void transformContextFailsClosed() {
+        var failure = new IllegalStateException("compaction service down");
         AgentHooks boom = new AgentHooks() {
-            @Override public List<AgentMessage> transformContext(List<AgentMessage> m, Cancellation c) {
-                throw new IllegalStateException("compaction service down");
-            }
+            @Override public List<AgentMessage> transformContext(List<AgentMessage> m, Cancellation c) { throw failure; }
         };
-        AgentHooks tag = new AgentHooks() {
-            @Override public List<AgentMessage> transformContext(List<AgentMessage> m, Cancellation c) {
-                var out = new ArrayList<AgentMessage>(m);
-                out.add(UserMessage.text("tagged", NOW));
-                return out;
-            }
-        };
-
-        var out = of(boom, tag).transformContext(List.of(UserMessage.text("a", NOW)), cancel);
-        assertEquals(2, out.size(), "the failed compaction must not lose the transcript");
+        assertSame(failure, assertThrows(IllegalStateException.class,
+                () -> of(boom).transformContext(List.of(UserMessage.text("a", NOW)), cancel)));
         assertEquals(List.of("transformContext"), reported);
     }
 
@@ -127,33 +118,49 @@ final class CompositeHooksTest {
         AgentHooks reminder = new AgentHooks() {
             @Override public List<AgentMessage> beforeTurn(TurnContext c) { return List.of(UserMessage.text("reminder", NOW)); }
         };
-        AgentHooks boom = new AgentHooks() {
-            @Override public List<AgentMessage> beforeTurn(TurnContext c) { throw new IllegalStateException("nope"); }
-        };
 
-        var out = of(skills, boom, reminder).beforeTurn(ctx());
+        var out = of(skills, reminder).beforeTurn(ctx());
         assertEquals(List.of("skill", "reminder"), out.stream().map(m -> ((UserMessage) m).text()).toList());
+    }
+
+    @Test
+    @DisplayName("beforeTurn fails closed instead of silently skipping an injection")
+    void beforeTurnFailsClosed() {
+        var failure = new IllegalStateException("nope");
+        AgentHooks boom = new AgentHooks() {
+            @Override public List<AgentMessage> beforeTurn(TurnContext c) { throw failure; }
+        };
+        assertSame(failure, assertThrows(IllegalStateException.class, () -> of(boom).beforeTurn(ctx())));
         assertEquals(List.of("beforeTurn"), reported);
     }
 
     @Test
-    @DisplayName("beforeRequest composes left to right and a throw leaves the request as it was")
+    @DisplayName("beforeRequest composes left to right and never mutates the original")
     void beforeRequestComposes() {
         var request = new LlmRequest(MODEL, "sys", List.of(), List.of(), ThinkingLevel.OFF, OptionalInt.empty(), Json.Obj.EMPTY);
         AgentHooks thinkHard = new AgentHooks() {
             @Override public LlmRequest beforeRequest(LlmRequest r, TurnContext c) { return r.withThinking(ThinkingLevel.HIGH); }
         };
-        AgentHooks boom = new AgentHooks() {
-            @Override public LlmRequest beforeRequest(LlmRequest r, TurnContext c) { throw new IllegalStateException("nope"); }
-        };
         AgentHooks rename = new AgentHooks() {
             @Override public LlmRequest beforeRequest(LlmRequest r, TurnContext c) { return r.withSystemPrompt(r.systemPrompt() + "!"); }
         };
 
-        var out = of(thinkHard, boom, rename).beforeRequest(request, ctx());
+        var out = of(thinkHard, rename).beforeRequest(request, ctx());
         assertEquals(ThinkingLevel.HIGH, out.thinking());
         assertEquals("sys!", out.systemPrompt());
         assertEquals(ThinkingLevel.OFF, request.thinking(), "the original request is never mutated");
+    }
+
+    @Test
+    @DisplayName("beforeRequest propagates a failed rewrite — the unrewritten request is never sent")
+    void beforeRequestFailsClosed() {
+        var request = new LlmRequest(MODEL, "sys", List.of(), List.of(), ThinkingLevel.OFF, OptionalInt.empty(), Json.Obj.EMPTY);
+        var failure = new IllegalStateException("nope");
+        AgentHooks boom = new AgentHooks() {
+            @Override public LlmRequest beforeRequest(LlmRequest r, TurnContext c) { throw failure; }
+        };
+        assertSame(failure, assertThrows(IllegalStateException.class, () -> of(boom).beforeRequest(request, ctx())));
+        assertEquals(List.of("beforeRequest"), reported);
     }
 
     @Test
@@ -224,23 +231,41 @@ final class CompositeHooksTest {
     }
 
     @Test
-    @DisplayName("beforeToolCall: a throwing hook degrades to ALLOW and a later Block still wins")
-    void aThrowingPermissionHookDoesNotOpenTheGate() {
+    @DisplayName("beforeToolCall: a throwing permission hook fails closed — never ALLOW")
+    void throwingPermissionHookFailsClosed() {
+        var failure = new IllegalStateException("permission service down");
         AgentHooks boom = new AgentHooks() {
-            @Override public ToolDecision beforeToolCall(BeforeToolCall call, Cancellation c) {
-                throw new IllegalStateException("permission service down");
-            }
+            @Override public ToolDecision beforeToolCall(BeforeToolCall call, Cancellation c) { throw failure; }
         };
-        AgentHooks blocks = new AgentHooks() {
-            @Override public ToolDecision beforeToolCall(BeforeToolCall call, Cancellation c) {
-                return ToolDecision.block("sandbox says no");
-            }
+        AgentHooks allows = new AgentHooks() {
+            @Override public ToolDecision beforeToolCall(BeforeToolCall call, Cancellation c) { return ToolDecision.ALLOW; }
         };
 
-        assertInstanceOf(ToolDecision.Block.class, of(boom, blocks).beforeToolCall(before(call().arguments()), cancel));
+        assertSame(failure, assertThrows(IllegalStateException.class,
+                () -> of(boom, allows).beforeToolCall(before(call().arguments()), cancel)));
         assertEquals(List.of("beforeToolCall"), reported);
-        assertSame(ToolDecision.ALLOW, of(boom).beforeToolCall(before(call().arguments()), cancel),
-                "with nothing else registered the stated fallback is ALLOW");
+    }
+
+    @Test
+    @DisplayName("a null decision is reported and fails closed")
+    void nullDecisionFailsClosed() {
+        AgentHooks nullHook = new AgentHooks() {
+            @Override public ToolDecision beforeToolCall(BeforeToolCall call, Cancellation c) { return null; }
+        };
+        assertThrows(NullPointerException.class, () -> of(nullHook).beforeToolCall(before(call().arguments()), cancel));
+        assertEquals(List.of("beforeToolCall"), reported);
+    }
+
+    @Test
+    @DisplayName("a failing reporter cannot replace the original decision failure")
+    void reporterFailureDoesNotReplaceTheOriginal() {
+        var original = new IllegalStateException("permission unavailable");
+        AgentHooks boom = new AgentHooks() {
+            @Override public ToolDecision beforeToolCall(BeforeToolCall call, Cancellation c) { throw original; }
+        };
+        var composite = new CompositeHooks(List.of(boom), (_, _) -> { throw new UnsupportedOperationException("logger down"); });
+        assertSame(original, assertThrows(IllegalStateException.class,
+                () -> composite.beforeToolCall(before(call().arguments()), cancel)));
     }
 
     // ---- result overrides -------------------------------------------------------------------------
@@ -265,26 +290,15 @@ final class CompositeHooksTest {
     }
 
     @Test
-    @DisplayName("afterToolCall: a throwing hook never loses the result the next hook produces")
-    void aThrowingAfterHookNeverLosesAResult() {
+    @DisplayName("afterToolCall: a throwing filter propagates — the unfiltered result is never handed on")
+    void throwingAfterHookFailsClosed() {
+        var failure = new IllegalStateException("audit sink unreachable");
         AgentHooks boom = new AgentHooks() {
-            @Override public Optional<ToolOverride> afterToolCall(AfterToolCall call, Cancellation c) {
-                throw new IllegalStateException("audit sink unreachable");
-            }
+            @Override public Optional<ToolOverride> afterToolCall(AfterToolCall call, Cancellation c) { throw failure; }
         };
-        AgentHooks annotate = new AgentHooks() {
-            @Override public Optional<ToolOverride> afterToolCall(AfterToolCall call, Cancellation c) {
-                return Optional.of(ToolOverride.content(List.of(ContentBlock.Text.of("kept"))));
-            }
-        };
-
-        ToolResult original = ToolResult.text("output");
-        var override = of(boom, annotate).afterToolCall(after(original), cancel).orElseThrow();
-        assertEquals("kept", override.applyTo(original).text());
+        assertSame(failure, assertThrows(IllegalStateException.class,
+                () -> of(boom).afterToolCall(after(ToolResult.text("output")), cancel)));
         assertEquals(List.of("afterToolCall"), reported);
-
-        assertTrue(of(boom).afterToolCall(after(original), cancel).isEmpty(),
-                "with nobody else registered the stated fallback is \"no override\"");
     }
 
     @Test

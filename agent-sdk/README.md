@@ -69,8 +69,12 @@ try (var agent = AgentBuilder.create()
 
 `agent.steer(msg)` injects a message before the next turn; `agent.followUp(msg)` runs after the
 current work finishes; `agent.abort()` cancels and clears both queues; `run.events()` is a
-bounded, blocking stream of this run's events; `agent.codec().encode(run.state())` checkpoints a
-run and `agent.resume(state)` continues it with fresh collaborators.
+bounded, **lossy** stream of this run's events (the newest 256 are kept; a consumer that stops
+reading never stalls the run — `run.result()` and the transcript are authoritative);
+`agent.codec().encode(run.state())` checkpoints a run (schema 3, strict on decode) and
+`agent.resume(state)` continues it with fresh collaborators, skipping the tool calls that already
+settled and keeping the turn's originally advertised tools. `agent.close()` is idempotent; a
+closed agent refuses new runs.
 
 ## Architecture in one paragraph
 
@@ -149,9 +153,14 @@ duplicate section ids, duplicate codecs all fail at `build()` naming both owners
 - **Policy** (permissions, sandboxing, loop detection, compaction) is an `AgentHooks`
   implementation. `beforeToolCall` is the permissions seam — it may block a call or rewrite its
   arguments (a sandbox prefix on a `bash` command lives here); `transformContext` is the compaction
-  seam (per-request, non-destructive); `beforeRequest` rewrites the request before it is sent;
-  `afterAssistant` can `Retry` (reprompt) or `Stop` the run. `TurnGuard` ships as the default
-  loop/budget policy and is replaceable with `AgentBuilder.turnGuard(...)`.
+  seam (per-request, non-destructive); `beforeRequest` rewrites the request before it is sent — a
+  tool it strips cannot be executed that turn; `afterAssistant` can `Retry` (reprompt) or `Stop`
+  the run. Hooks **fail closed**: a throwing `beforeToolCall`/`afterToolCall` becomes that call's
+  `HOOK_FAILED` result (never `ALLOW`, never the unfiltered output), any other throwing hook ends
+  the run as `Failed`; only `onEvent` is isolated. `TurnGuard` ships as the default loop and
+  response-quality policy (repeated batches, a dominant call, empty and truncated turns) and is
+  replaceable with `AgentBuilder.turnGuard(...)`; the turn, tool-call and wall-clock budgets are
+  the engine's own and stay enforced without it.
 - **Custom transcript entries** implement `AgentMessage` and register an `AgentMessageCodec` so
   they survive checkpoint and resume.
 - **A dynamic tool source** implements `ToolProvider` and returns a new list from `tools()`
@@ -160,13 +169,23 @@ duplicate section ids, duplicate codecs all fail at `build()` naming both owners
 ## Guarantees worth knowing
 
 - Twelve event invariants (`RecordingSink.assertInvariants()` in the testkit): `RunStart` first,
-  `RunEnd` last on every path including uncaught throws, every message and tool call paired, tool
-  results in source order, no event after `RunEnd`.
-- A failed turn is a message with `stopReason ∈ {ERROR, ABORTED}`, never an exception; a run's
-  outcome is a sealed `RunOutcome`, never a thrown one.
-- Cancellation reaches work through the flag, thread interrupt and callbacks at once; five
-  checkpoints in the engine observe it; `Fork.close()` can never hang; `agent.abort()` never blocks
-  on a child process.
+  `RunEnd` last on every path including a throwing hook, every message and tool call paired, one
+  result per tool call in source order — a call that never ran (a `Stop`/`Retry` verdict, a
+  truncated or failed turn, an abort) is padded with `action was not executed`, so the transcript
+  is always valid for the next request — no event after `RunEnd`.
+- A failed turn is a message with `stopReason ∈ {ERROR, ABORTED}`, never an exception, and never
+  executes the calls it collected; a stalled stream is a failed turn; a run's outcome is a sealed
+  `RunOutcome`, never a thrown one.
+- Cancellation reaches work through the flag, thread interrupt and callbacks at once: every
+  checkpoint observes it and, while a row runs, the driver thread is interrupted wherever it
+  blocks — a provider that never answers, a hook that never returns, a tool that never finishes.
+  A `wallClock` limit arms a deadline timer that cancels the run the same way and reports
+  `WALL_CLOCK`. An abandoned tool can publish nothing after its `ToolEnd`; `Fork.close()` can
+  never hang; `agent.abort()` never blocks on a child process.
+- MCP: structured results reach the model as JSON even without text content; `tools/list` is
+  paginated with a page cap and cursor-cycle detection, and a partial catalog is never published;
+  a connection that completes after the connect budget, or a catalog collision at start-up,
+  closes its child process instead of leaking it.
 
 ## Licence notices
 

@@ -10,9 +10,9 @@ import sdk.agent.message.Usage;
 /// opaque: a text delta may split a surrogate pair and an arguments fragment is partial JSON, so
 /// neither is inspected before its `*End`.
 ///
-/// `ToolCallStart.initialArguments` and `ToolCallDelta.replace` exist for one rule: when the
-/// assembled arguments fail to parse, the start snapshot is a fallback **only if the stream did
-/// not stall** — otherwise a truncated `replace=true` delta would make the engine act on stale data.
+/// `ToolCallStart.initialArguments` is used only when no argument fragment arrives at all (a
+/// provider that sends the arguments whole). Once fragments arrive they are authoritative: if
+/// they do not parse, the call is refused rather than run on a possibly stale snapshot.
 public sealed interface LlmStreamEvent {
 
     record Start()                                                                     implements LlmStreamEvent { }

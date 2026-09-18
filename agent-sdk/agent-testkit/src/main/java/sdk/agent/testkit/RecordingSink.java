@@ -21,16 +21,10 @@ import sdk.agent.message.ToolResultMessage;
 /// JUnit, from a host's own harness and from a `main`. Recording is thread-safe because a parallel
 /// tool batch emits `ToolUpdate` from several virtual threads at once.
 ///
-/// **Two invariants are weaker here than their one-line statement, and deliberately so.**
-///  * I10 (`toolCalls().size() == toolResults().size()`) holds for a turn that *ran* tools. The
-///    `Stop`/`Retry` verdicts emit `TurnEnd(assistant, [])` for an assistant that may carry
-///    tool-call blocks — a malformed batch is refused before any `ToolStart`. So the check is:
-///    a turn with any `ToolStart` must be fully index-aligned; a turn with none must have no
-///    results at all.
-///  * I9 (no interleaving with steering) is checked as: once a turn has announced a tool call, no
-///    message other than a `ToolResultMessage` may appear before its `TurnEnd`. A `Stop` verdict's
-///    own message is emitted between the assistant `MessageEnd` and the `TurnEnd` by design, and
-///    that turn never ran a tool.
+/// I10 is strict: every closed turn carries exactly one result per assistant tool call — a call
+/// that never ran is padded with `ToolMessages.NOT_EXECUTED`. I9 (no interleaving with steering)
+/// is checked as: once the assistant announced calls, no message other than a `ToolResultMessage`
+/// may appear before its `TurnEnd`; a `Stop` verdict's own message follows the `TurnEnd`.
 public final class RecordingSink implements EventSink {
 
     private final Object lock = new Object();
@@ -129,7 +123,7 @@ public final class RecordingSink implements EventSink {
 
         private boolean turnOpen;
         private boolean assistantClosed;                       // this turn's assistant MessageEnd seen
-        private boolean turnAnnouncedATool;                    // any ToolStart in this turn
+        private boolean turnHasCalls;                          // this turn's assistant carries tool calls
         private final List<String> resultsInTurn = new ArrayList<>();
 
         private final Set<String> openTools = new LinkedHashSet<>();
@@ -163,7 +157,7 @@ public final class RecordingSink implements EventSink {
                     if (turnOpen) throw fail("I8", "a TurnEnd before the next TurnStart", "a nested TurnStart", i, all);
                     turnOpen = true;
                     assistantClosed = false;
-                    turnAnnouncedATool = false;
+                    turnHasCalls = false;
                     resultsInTurn.clear();
                 }
 
@@ -189,7 +183,10 @@ public final class RecordingSink implements EventSink {
                         throw fail("I3", "MessageEnd of the message that was started", "MessageEnd of a different message", i, all);
                     }
                     if (message instanceof ToolResultMessage r) resultsInTurn.add(r.toolCallId());
-                    if (turnOpen && message instanceof AssistantMessage) assistantClosed = true;
+                    if (turnOpen && message instanceof AssistantMessage a) {
+                        assistantClosed = true;
+                        turnHasCalls = !a.toolCalls().isEmpty();
+                    }
                     openMessage = null;
                     openMessageIsAssistant = false;
                 }
@@ -205,7 +202,6 @@ public final class RecordingSink implements EventSink {
                 case AgentEvent.ToolStart(_, _, _, var id, _, _) -> {
                     if (!seenTools.add(id)) throw fail("I5", "one ToolStart per tool call id", "a second ToolStart for " + id, i, all);
                     openTools.add(id);
-                    turnAnnouncedATool = true;
                 }
 
                 case AgentEvent.ToolUpdate(_, _, _, var id, _, _) -> {
@@ -221,9 +217,9 @@ public final class RecordingSink implements EventSink {
             }
         }
 
-        /// I9 — once a turn has announced a tool call, only tool results may follow until `TurnEnd`.
+        /// I9 — once the assistant announced tool calls, only tool results may follow until `TurnEnd`.
         private void checkSteeringIsolation(int i, AgentMessage message) {
-            if (!turnOpen || !assistantClosed || !turnAnnouncedATool) return;
+            if (!turnOpen || !assistantClosed || !turnHasCalls) return;
             if (message instanceof ToolResultMessage) return;
             throw fail("I9", "only ToolResultMessages between an assistant message and its TurnEnd",
                     "a " + message.kind() + " message", i, all);
@@ -231,9 +227,9 @@ public final class RecordingSink implements EventSink {
 
         private void checkTurnEnd(int i, AssistantMessage assistant, List<ToolResultMessage> results) {
             List<ContentBlock.ToolCall> calls = assistant.toolCalls();
-            if (!turnAnnouncedATool) {
+            if (calls.isEmpty()) {
                 if (!results.isEmpty()) {
-                    throw fail("I7", "no tool results in a turn that announced no tool call",
+                    throw fail("I7", "no tool results in a turn with no tool calls",
                             results.size() + " result(s)", i, all);
                 }
                 return;

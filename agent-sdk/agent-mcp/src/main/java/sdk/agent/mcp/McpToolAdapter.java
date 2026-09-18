@@ -4,6 +4,7 @@ import java.util.Objects;
 
 import io.modelcontextprotocol.spec.McpSchema;
 import sdk.agent.json.Json;
+import sdk.agent.tool.ErrorKind;
 import sdk.agent.tool.ParamCodec;
 import sdk.agent.tool.Tool;
 import sdk.agent.tool.ToolInvocation;
@@ -14,6 +15,8 @@ import sdk.agent.tool.ToolResult;
 /// `agentName → (server, remoteName)` mapping: both halves are fields, so no code anywhere has to
 /// reverse-parse a composed name.
 final class McpToolAdapter implements Tool<Json> {
+
+    static final String NOT_AN_OBJECT = "MCP tool arguments must be a JSON object";
 
     private final McpCaller connection;
     private final String remoteName;
@@ -50,7 +53,9 @@ final class McpToolAdapter implements Tool<Json> {
 
     @Override public ToolKind kind() { return kind; }
 
+    /// The passthrough codec accepts any JSON; the wire shape is checked here, as a model-facing result.
     @Override public ToolResult execute(ToolInvocation<Json> call) throws InterruptedException {
+        if (!(call.params() instanceof Json.Obj)) return ToolResult.error(ErrorKind.INVALID_ARGUMENTS, NOT_AN_OBJECT);
         return connection.call(remoteName, call.params(), call.cancel());
     }
 

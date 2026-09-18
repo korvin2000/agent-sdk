@@ -44,7 +44,7 @@ class McpConnectionPoolTest {
     void anEmptyServerListConnectsToNothingAndContributesAnEmptyCatalog() {
         try (var pool = McpConnectionPool.connect(List.of())) {
             assertEquals(List.of(), pool.results());
-            assertTrue(pool.tools().isEmpty());
+            assertTrue(pool.provider().tools().isEmpty());
             assertEquals("sdk.agent.mcp", pool.provider().id());
         }
     }
@@ -69,7 +69,7 @@ class McpConnectionPoolTest {
             assertEquals("skipped", results.get(1).name());
             assertEquals("disabled", results.get(1).error().orElseThrow());
 
-            assertTrue(pool.tools().isEmpty());
+            assertTrue(pool.provider().tools().isEmpty());
         }
     }
 }
