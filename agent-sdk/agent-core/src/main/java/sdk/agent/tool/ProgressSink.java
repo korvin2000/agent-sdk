@@ -1,7 +1,7 @@
 package sdk.agent.tool;
 
-/// Streaming partial results out of a running tool. [#update] **blocks** — backpressure for free on
-/// a virtual thread, and no batching array, no flush-after-resolve and no late-emit crash.
+/// Partial tool results. The engine ignores updates after cancellation or batch settlement.
+/// Listener callbacks run synchronously; pull-stream observation is bounded and lossy.
 @FunctionalInterface
 public interface ProgressSink {
 

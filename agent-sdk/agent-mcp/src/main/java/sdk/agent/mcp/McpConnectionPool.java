@@ -8,27 +8,21 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Objects;
 import java.util.SequencedMap;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.TimeoutException;
+import java.util.function.BiFunction;
 
 import sdk.agent.concurrent.Fork;
-import sdk.agent.tool.Tool;
 
 /// Every connection this module owns. Connects in parallel, fault-isolated, and reports in
-/// **declaration order** rather than completion order.
-///
-/// **Atomic registration**: a server appears in the tool list only after `initialize()` *and*
-/// `tools/list` have both succeeded. A half-connected server is closed by [McpConnection#open] and
-/// never registered, so a handshake-ok/list-failed stdio server cannot leak its child process.
+/// declaration order rather than completion order.
 final class McpConnectionPool implements AutoCloseable {
 
     private static final System.Logger LOG = System.getLogger(McpConnectionPool.class.getName());
     private static final Duration CONNECT_BUDGET = Duration.ofSeconds(60);
     private static final Duration CONNECT_CLOSE_GRACE = Duration.ofSeconds(5);
 
-    /// Immutable after construction, so a `tools/list_changed` arriving on a notification thread
-    /// can iterate it while the host is tearing the pool down.
     private final SequencedMap<String, McpConnection> connections;
     private final List<McpInitResult> results;
     private final McpToolProvider provider = new McpToolProvider();
@@ -40,72 +34,106 @@ final class McpConnectionPool implements AutoCloseable {
     }
 
     static McpConnectionPool connect(List<McpServerConfig> servers) {
-        Objects.requireNonNull(servers, "servers");
-        // Sanitised ONCE, here, before any connection is attempted: a collision is a hard error
-        // now rather than a silently shadowed server later.
-        SequencedMap<String, McpServerConfig> byServer = sanitizedNames(servers);
+        return connect(servers, CONNECT_BUDGET);
+    }
 
+    static McpConnectionPool connect(List<McpServerConfig> servers, Duration budget) {
+        return connect(servers, budget, McpConnection::open);
+    }
+
+    static McpConnectionPool connect(List<McpServerConfig> servers, Duration budget,
+            BiFunction<McpServerConfig, String, McpConnection> connector) {
+        Objects.requireNonNull(servers, "servers");
+        Objects.requireNonNull(connector, "connector");
+        Objects.requireNonNull(budget, "budget");
+        if (budget.isNegative() || budget.isZero()) throw new IllegalArgumentException("connect budget must be positive");
+        SequencedMap<String, McpServerConfig> byServer = sanitizedNames(servers);
         var attempts = new LinkedHashMap<String, Attempt>();
         try (var fork = Fork.open(CONNECT_CLOSE_GRACE)) {
-            byServer.forEach((server, config) -> attempts.put(server,
-                    new Attempt(server, fork.fork("mcp-connect-" + server, () -> McpConnection.open(config, server)))));
-            joinQuietly(fork);
+            byServer.forEach((server, config) -> {
+                var attempt = new Attempt(server, config, connector);
+                attempts.put(server, attempt);
+                attempt.start(fork);
+            });
+            try {
+                fork.joinUntil(Instant.now().plus(budget));
+            } catch (TimeoutException e) {
+                LOG.log(System.Logger.Level.WARNING, "MCP connect budget of {0}s expired", budget.toSeconds());
+                attempts.values().forEach(Attempt::abandon);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                attempts.values().forEach(Attempt::abandon);
+            }
         }
 
         var live = new LinkedHashMap<String, McpConnection>();
-        attempts.forEach((server, attempt) -> {
-            McpConnection connection = attempt.result();
-            if (connection != null) live.put(server, connection);
-        });
+        var results = new ArrayList<McpInitResult>(servers.size());
+        for (McpServerConfig config : servers) {
+            if (!config.enabled()) {
+                results.add(McpInitResult.disabled(config.name()));
+                continue;
+            }
+            String server = McpNaming.sanitizeServer(config.name());
+            Attempt.Resolved resolved = attempts.get(server).resolve();
+            if (resolved.connection() != null) {
+                live.put(server, resolved.connection());
+                results.add(McpInitResult.ok(config.name(), server, resolved.connection().tools().size()));
+            } else {
+                results.add(McpInitResult.failed(config.name(), server, resolved.error()));
+            }
+        }
 
-        var pool = new McpConnectionPool(live, collect(servers, attempts));
-        pool.connections.values().forEach(c -> c.onToolsChanged(() -> pool.republish(false)));
-        pool.republish(true);
-        return pool;
+        var pool = new McpConnectionPool(live, results);
+        try {
+            pool.connections.values().forEach(c -> c.onToolsChanged(() -> pool.republish(false)));
+            pool.republish(true);
+            return pool;
+        } catch (RuntimeException e) {
+            try {
+                pool.closeAll();
+            } catch (RuntimeException closeFailure) {
+                e.addSuppressed(closeFailure);
+            }
+            throw e;
+        }
     }
 
-    List<Tool<?>> tools() { return provider.tools(); }
-
     McpToolProvider provider() { return provider; }
-
     List<McpInitResult> results() { return results; }
 
-    /// Rebuilds the namespaced tool list from every registered connection and publishes a **new**
-    /// immutable snapshot; the previous one is never mutated.
-    private void republish(boolean strict) {
-        if (closed.get()) {
-            provider.publish(List.of());
-            return;
-        }
+    private synchronized void republish(boolean strict) {
+        if (closed.get()) return;
         var adapters = new ArrayList<McpToolAdapter>();
         connections.values().forEach(c -> c.tools().forEach(t -> adapters.add(new McpToolAdapter(c, t))));
         provider.publish(McpToolProvider.catalogOf(adapters, strict));
     }
-
-    /// Resilient disconnect, in reverse connect order: every client closed in its own try/catch, a
-    /// tally logged, and the tool list emptied so no stale tool survives the teardown.
     void closeAll() {
-        if (!closed.compareAndSet(false, true)) return;
-        var names = new ArrayList<>(connections.sequencedKeySet());
-        int done = 0;
-        for (int i = names.size() - 1; i >= 0; i--) {
-            String server = names.get(i);
+        List<McpConnection> owned;
+        RuntimeException publishFailure = null;
+        synchronized (this) {
+            if (!closed.compareAndSet(false, true)) return;
+            connections.values().forEach(c -> c.onToolsChanged(() -> { }));
             try {
-                connections.get(server).close();
+                provider.publish(List.of());
+            } catch (RuntimeException e) {
+                publishFailure = e;
+            }
+            owned = new ArrayList<>(connections.reversed().values());
+        }
+        int done = 0;
+        for (McpConnection connection : owned) {
+            try {
+                connection.close();
                 done++;
             } catch (RuntimeException e) {
-                LOG.log(System.Logger.Level.WARNING, "closing MCP server " + server + " threw", e);
+                LOG.log(System.Logger.Level.WARNING, "closing MCP connection threw", e);
             }
         }
-        provider.publish(List.of());
-        LOG.log(System.Logger.Level.DEBUG, "closed {0} of {1} MCP connections", done, names.size());
+        LOG.log(System.Logger.Level.DEBUG, "closed {0} of {1} MCP connections", done, owned.size());
+        if (publishFailure != null) throw publishFailure;
     }
-
     @Override public void close() { closeAll(); }
 
-    // ---- startup helpers -------------------------------------------------------------------
-
-    /// @throws IllegalArgumentException naming **both** raw names if two sanitise alike
     static SequencedMap<String, McpServerConfig> sanitizedNames(List<McpServerConfig> servers) {
         var byServer = new LinkedHashMap<String, McpServerConfig>();
         for (McpServerConfig config : servers) {
@@ -121,68 +149,49 @@ final class McpConnectionPool implements AutoCloseable {
         return byServer;
     }
 
-    private static void joinQuietly(Fork fork) {
-        try {
-            fork.joinUntil(Instant.now().plus(CONNECT_BUDGET));
-        } catch (TimeoutException _) {
-            LOG.log(System.Logger.Level.WARNING, "MCP connect budget of {0}s expired", CONNECT_BUDGET.toSeconds());
-        } catch (InterruptedException _) {
-            Thread.currentThread().interrupt();
+    private static final class Attempt {
+        private static final Object PENDING = new Object();
+        private final String server;
+        private final McpServerConfig config;
+        private final BiFunction<McpServerConfig, String, McpConnection> connector;
+        private final AtomicReference<Object> slot = new AtomicReference<>(PENDING);
+
+        Attempt(String server, McpServerConfig config,
+                BiFunction<McpServerConfig, String, McpConnection> connector) {
+            this.server = server;
+            this.config = config;
+            this.connector = connector;
         }
-    }
 
-    private static List<McpInitResult> collect(List<McpServerConfig> servers, LinkedHashMap<String, Attempt> attempts) {
-        var out = new ArrayList<McpInitResult>(servers.size());
-        for (McpServerConfig config : servers) {
-            if (!config.enabled()) {
-                out.add(McpInitResult.disabled(config.name()));
-                continue;
-            }
-            String server = McpNaming.sanitizeServer(config.name());
-            Attempt attempt = attempts.get(server);
-            McpConnection connection = attempt.result();
-            out.add(connection == null
-                    ? McpInitResult.failed(config.name(), server, attempt.error())
-                    : McpInitResult.ok(config.name(), server, connection.tools().size()));
-        }
-        return out;
-    }
-
-    /// One server's connect attempt. Resolving the handle is fault-isolated: a throw becomes a
-    /// failed [McpInitResult], never a failure of the whole pool.
-    private record Attempt(String server, Fork.Handle<McpConnection> handle) {
-
-        McpConnection result() {
-            try {
-                return handle.get();
-            } catch (InterruptedException _) {
-                Thread.currentThread().interrupt();
+        void start(Fork fork) {
+            fork.fork("mcp-connect-" + server, () -> {
+                try {
+                    McpConnection candidate = connector.apply(config, server);
+                    if (!slot.compareAndSet(PENDING, candidate)) candidate.close();
+                } catch (RuntimeException e) {
+                    slot.compareAndSet(PENDING, e);
+                }
                 return null;
-            } catch (RuntimeException | ExecutionException _) {
-                return null;
-            }
+            });
         }
 
-        String error() {
-            try {
-                handle.get();
-                return "";
-            } catch (InterruptedException _) {
-                Thread.currentThread().interrupt();
-                return "interrupted";
-            } catch (ExecutionException e) {
-                return describe(e.getCause());
-            } catch (RuntimeException e) {
-                return describe(e);
-            }
+        void abandon() { slot.compareAndSet(PENDING, Abandoned.INSTANCE); }
+
+        Resolved resolve() {
+            Object value = slot.get();
+            if (value instanceof McpConnection connection) return new Resolved(connection, "");
+            if (value instanceof Throwable t) return new Resolved(null, describe(t));
+            return new Resolved(null, value == Abandoned.INSTANCE || value == PENDING
+                    ? "connect budget expired" : "unknown failure");
         }
+
+        private record Resolved(McpConnection connection, String error) { }
 
         private static String describe(Throwable t) {
-            if (t == null) return "unknown failure";
             String message = t.getMessage();
             return message == null || message.isBlank()
-                    ? t.getClass().getSimpleName()
-                    : t.getClass().getSimpleName() + ": " + message;
+                    ? t.getClass().getSimpleName() : t.getClass().getSimpleName() + ": " + message;
         }
     }
+    private enum Abandoned { INSTANCE }
 }

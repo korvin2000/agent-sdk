@@ -1,6 +1,7 @@
 package sdk.agent;
 
 import java.io.IOException;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
@@ -9,8 +10,8 @@ import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.function.Supplier;
 
+import sdk.agent.concurrent.Fork;
 import sdk.agent.event.AgentEvent;
 import sdk.agent.event.RunOutcome;
 import sdk.agent.hook.TurnContext;
@@ -18,12 +19,9 @@ import sdk.agent.hook.TurnVerdict;
 import sdk.agent.message.AgentMessage;
 import sdk.agent.message.AssistantMessage;
 import sdk.agent.message.ContentBlock;
-import sdk.agent.message.Message;
-import sdk.agent.message.MessageConverter;
 import sdk.agent.message.StopReason;
 import sdk.agent.message.ToolResultMessage;
 import sdk.agent.provider.LlmRequest;
-import sdk.agent.provider.LlmStream;
 import sdk.agent.provider.LlmStreamEvent;
 import sdk.agent.tool.ToolKind;
 import sdk.agent.tool.ToolRegistry;
@@ -47,9 +45,8 @@ import sdk.agent.turn.TurnState;
 /// | `FOLLOW_UP` | ck5; drain follow-ups | `TURN_OPENING` or `FINISHED` |
 /// | `FINISHED` | `RunEnd` (idempotent) | `Step.Done` |
 ///
-/// A `RunEngine` instance serves exactly one run: the `RunEnd` guard is its only mutable field,
-/// and it fires from the `FINISHED` row **and** from the catch in [#advance], so a subscriber sees
-/// `RunEnd(produced, Failed(…))` for an uncaught throw exactly as it sees a clean finish.
+/// A `RunEngine` instance serves exactly one run. Ordinary collaborator failures finalize the
+/// current state; JVM-fatal errors are not recoverable. `RunEnd` is emitted at most once.
 public final class RunEngine {
 
     private static final System.Logger LOG = System.getLogger(RunEngine.class.getName());
@@ -71,11 +68,29 @@ public final class RunEngine {
     public Step advance(RunState s, RunDeps d) {
         Objects.requireNonNull(s, "state");
         Objects.requireNonNull(d, "deps");
-        try {
-            return row(s, d);
-        } catch (Throwable t) {
-            emitRunEnd(s, new RunOutcome.Failed(StopReason.ERROR, ToolFunnel.describe(t), t), d);
-            throw t;
+        var b = s.toBuilder();
+        try (var _ = d.cancel().interruptOnCancel(Thread.currentThread());
+             var timer = b.limits.wallClock().isPresent() ? Fork.open() : null) {
+            if (timer != null) {
+                Duration remaining = Duration.between(now(d), b.startedAt.plus(b.limits.wallClock().orElseThrow()));
+                timer.fork("run-deadline", () -> {
+                    if (remaining.isPositive()) Thread.sleep(remaining);
+                    d.cancel().cancel();
+                    return null;
+                });
+            }
+            Step result = row(b, d);
+            if (!(result instanceof Step.Done)) {
+                Optional<RunOutcome> tripped = checkpoint(b, d);
+                if (tripped.isPresent()) return abort(b, d, tripped.get());
+            }
+            return result;
+        } catch (RuntimeException failure) {
+            abort(b, d, checkpoint(b, d).orElseGet(() ->
+                    new RunOutcome.Failed(StopReason.ERROR, ToolFunnel.describe(failure), failure)));
+            return finish(b, d);
+        } finally {
+            if (d.cancel().isCancelled()) Thread.interrupted();
         }
     }
 
@@ -88,22 +103,21 @@ public final class RunEngine {
 
     // ---- the rows -----------------------------------------------------------------------------
 
-    private Step row(RunState s, RunDeps d) {
-        return switch (s.phase()) {
-            case NEW             -> begin(s, d);
-            case TURN_OPENING    -> openTurn(s, d);
-            case ASSISTANT_READY -> judge(s, d);
-            case TOOLS_RUNNING   -> runTools(s, d);
-            case TURN_CLOSED     -> closeTurn(s, d);
-            case FOLLOW_UP       -> followUp(s, d);
-            case FINISHED        -> finish(s, d);
+    private Step row(RunState.Builder b, RunDeps d) {
+        return switch (b.phase) {
+            case NEW             -> begin(b, d);
+            case TURN_OPENING    -> openTurn(b, d);
+            case ASSISTANT_READY -> judge(b, d);
+            case TOOLS_RUNNING   -> runTools(b, d);
+            case TURN_CLOSED     -> closeTurn(b, d);
+            case FOLLOW_UP       -> followUp(b, d);
+            case FINISHED        -> finish(b, d);
         };
     }
 
-    private Step begin(RunState s, RunDeps d) {
-        var b = s.toBuilder();
-        emit(new AgentEvent.RunStart(s.runId(), AgentEvent.RUN_SCOPED, now(d)), d);
-        var inject = new ArrayList<>(s.pendingInjection());
+    private Step begin(RunState.Builder b, RunDeps d) {
+        emit(new AgentEvent.RunStart(b.runId, AgentEvent.RUN_SCOPED, now(d)), d);
+        var inject = new ArrayList<>(b.pendingInjection);
         b.pendingInjection.clear();
         inject.addAll(d.steering().get());
         for (AgentMessage m : inject) emitAndAppend(b, m, AgentEvent.RUN_SCOPED, d);
@@ -111,31 +125,31 @@ public final class RunEngine {
         return new Step.Continue(b.build());
     }
 
-    private Step openTurn(RunState s, RunDeps d) {
-        Optional<RunOutcome> tripped = checkpoint(s, d);                              // ck1
-        if (tripped.isPresent()) return abort(s, d, tripped.get());
+    private Step openTurn(RunState.Builder b, RunDeps d) {
+        Optional<RunOutcome> tripped = checkpoint(b, d);
+        if (tripped.isPresent()) return abort(b, d, tripped.get());
+        if (b.turnsUsed >= b.limits.maxTurns()) {
+            return abort(b, d, new RunOutcome.LimitExceeded(RunOutcome.Limit.MAX_TURNS,
+                    "turn cap reached: " + b.limits.maxTurns()));
+        }
 
-        var b = s.toBuilder();
-        var injected = new ArrayList<>(s.pendingInjection());
+        var injected = new ArrayList<>(b.pendingInjection);
         b.pendingInjection.clear();
-        TurnContext ctx = context(s, d);
-        injected.addAll(safely(() -> d.hooks().beforeTurn(ctx), List.of()));
-        for (AgentMessage m : injected) emitAndAppend(b, m, s.turnIndex(), d);
+        injected.addAll(Objects.requireNonNull(d.hooks().beforeTurn(context(b.build(), d)), "beforeTurn returned null"));
+        for (AgentMessage m : injected) emitAndAppend(b, m, b.turnIndex, d);
 
+        tripped = checkpoint(b, d);
+        if (tripped.isPresent()) return abort(b, d, tripped.get());
         RunState opened = b.build();
-        tripped = checkpoint(opened, d);                                               // ck2
-        if (tripped.isPresent()) return abort(opened, d, tripped.get());
-
-        TurnContext ctx2 = context(opened, d);
-        List<AgentMessage> transformed = safely(() -> d.hooks().transformContext(opened.transcript(), d.cancel()), opened.transcript());
-        List<Message> converted = safely(() -> d.converter().toLlm(transformed), MessageConverter.DEFAULT.toLlm(transformed));
+        List<AgentMessage> transformed = Objects.requireNonNull(
+                d.hooks().transformContext(opened.transcript(), d.cancel()), "transformContext returned null");
+        var converted = Objects.requireNonNull(d.converter().toLlm(transformed), "converter returned null");
         LlmRequest built = d.requestTemplate().withMessages(converted).withTools(d.tools().specs());
-        LlmRequest request = safely(() -> d.hooks().beforeRequest(built, ctx2), built);
+        LlmRequest request = Objects.requireNonNull(d.hooks().beforeRequest(built, context(opened, d)),
+                "beforeRequest returned null");
 
-        b = opened.toBuilder();
-        TurnState turn = drive(TurnState.opening(s.runId(), s.turnIndex(), request.model()), request, b, d);
-        b.turn = turn;
         b.turnsUsed++;
+        TurnState turn = drive(TurnState.opening(b.runId, b.turnIndex, request.model()), request, b, d);
         b.usage = b.usage.plus(turn.assistant().usage());
         b.phase = Phase.ASSISTANT_READY;
         return new Step.Continue(b.build());
@@ -146,15 +160,15 @@ public final class RunEngine {
         StepOutcome out = step(turn, new StepInput.Begin(request), b, d);
         turn = out.state();
 
-        LlmStream stream;
-        try {
-            stream = d.provider().stream(request, d.cancel());
-        } catch (IOException | RuntimeException e) {
-            return step(turn, new StepInput.StreamFailed(ToolFunnel.describe(e), false), b, d).state();
-        }
-        if (stream == null) return step(turn, new StepInput.StreamFailed("provider returned no stream", false), b, d).state();
-
-        try (var pump = new ProviderPump(stream, d.cancel())) {
+        try (var pump = new ProviderPump(d.provider(), request, d.cancel())) {
+            try {
+                pump.awaitOpen();
+            } catch (IOException | RuntimeException e) {
+                return step(turn, new StepInput.StreamFailed(ToolFunnel.describe(e), false), b, d).state();
+            } catch (InterruptedException _) {
+                Thread.currentThread().interrupt();
+                return step(turn, new StepInput.Cancel(), b, d).state();
+            }
             out = step(turn, new StepInput.StreamOpened(), b, d);
             turn = out.state();
             while (turn.phase() == TurnPhase.STREAMING) {
@@ -182,71 +196,67 @@ public final class RunEngine {
         return turn;
     }
 
-    private Step judge(RunState s, RunDeps d) {
-        var b = s.toBuilder();
-        TurnState turn = s.turn();
+    private Step judge(RunState.Builder b, RunDeps d) {
+        Optional<RunOutcome> tripped = checkpoint(b, d);
+        if (tripped.isPresent()) return abort(b, d, tripped.get());
+        TurnState turn = b.turn;
         AssistantMessage assistant = turn.assistant();
-        TurnContext ctx = context(s, d);
-        TurnVerdict verdict = safely(() -> d.hooks().afterAssistant(assistant, ctx), TurnVerdict.PROCEED);
+        if (assistant.stopReason() == StopReason.ERROR || assistant.stopReason() == StopReason.ABORTED) {
+            return abort(b, d, outcomeOf(assistant));
+        }
+        TurnVerdict verdict = Objects.requireNonNull(
+                d.hooks().afterAssistant(assistant, context(b.build(), d)), "afterAssistant returned null");
         switch (verdict) {
             case TurnVerdict.Stop(var outcome, var message) -> {
-                if (message != null) emitAndAppend(b, message, s.turnIndex(), d);
-                b.turn = step(turn, new StepInput.Verdict(verdict), b, d).state();
+                step(turn, new StepInput.Verdict(verdict), b, d);
+                if (message != null) emitAndAppend(b, message, b.turnIndex, d);
                 b.outcome = outcome;
                 b.phase = Phase.FINISHED;
             }
             case TurnVerdict.Retry(var message, var reason) -> {
-                LOG.log(System.Logger.Level.DEBUG, "turn {0} retried: {1}", s.turnIndex(), reason);
-                b.turn = step(turn, new StepInput.Verdict(verdict), b, d).state();
+                LOG.log(System.Logger.Level.DEBUG, "turn {0} retried: {1}", b.turnIndex, reason);
+                step(turn, new StepInput.Verdict(verdict), b, d);
                 b.pendingInjection.add(message);
                 b.turnIndex++;
                 b.phase = Phase.TURN_OPENING;
             }
             case TurnVerdict.Proceed _ -> {
-                StepOutcome out = step(turn, new StepInput.Verdict(verdict), b, d);
-                b.turn = out.state();
+                // A truncated turn never grants execution, even when the guard is disabled.
+                StepOutcome out = step(turn, assistant.stopReason() == StopReason.LENGTH
+                        ? new StepInput.Cancel() : new StepInput.Verdict(verdict), b, d);
                 b.phase = out instanceof StepOutcome.Finished ? Phase.TURN_CLOSED : Phase.TOOLS_RUNNING;
             }
         }
         return new Step.Continue(b.build());
     }
 
-    private Step runTools(RunState s, RunDeps d) {
-        Optional<RunOutcome> tripped = checkpoint(s, d);                              // ck3
-        if (tripped.isPresent()) return abort(s, d, tripped.get());
+    private Step runTools(RunState.Builder b, RunDeps d) {
+        Optional<RunOutcome> tripped = checkpoint(b, d);
+        if (tripped.isPresent()) return abort(b, d, tripped.get());
 
-        TurnState turn = s.turn();
-        List<ContentBlock.ToolCall> batch = firstBatch(turn.pendingCalls(), s.limits().toolExecution(), d.tools());
-        int cap = s.limits().maxToolCalls();
-        if (s.toolCallsUsed() + batch.size() > cap) {
-            return abort(s, d, new RunOutcome.LimitExceeded(RunOutcome.Limit.MAX_TOOL_CALLS, "tool call cap reached: " + cap));
+        TurnState turn = b.turn;
+        List<ContentBlock.ToolCall> batch = firstBatch(turn.pendingCalls(), b.limits.toolExecution(), d.tools());
+        int cap = b.limits.maxToolCalls();
+        if (batch.size() > cap - b.toolCallsUsed) {
+            return abort(b, d, new RunOutcome.LimitExceeded(RunOutcome.Limit.MAX_TOOL_CALLS,
+                    "tool call cap reached: " + cap));
         }
 
-        var b = s.toBuilder();
-        var funnel = new ToolFunnel(d, s, context(s, d), e -> apply(b, List.of(e), d));
-        List<ToolResultMessage> results;
-        try {
-            results = funnel.runBatch(batch, batch.size() > 1);
-        } catch (InterruptedException _) {
-            Thread.currentThread().interrupt();
-            return abort(b.build(), d, new RunOutcome.Aborted());
-        }
+        RunState current = b.build();
+        var funnel = new ToolFunnel(d, current, context(current, d), e -> apply(b, List.of(e), d));
+        List<ToolResultMessage> results = funnel.runBatch(batch, batch.size() > 1);
         for (ToolResultMessage r : results) turn = step(turn, new StepInput.ToolSettled(r.toolCallId(), r), b, d).state();
-        b.turn = turn;
         b.toolCallsUsed += batch.size();
         b.phase = turn.phase() == TurnPhase.CLOSED ? Phase.TURN_CLOSED : Phase.TOOLS_RUNNING;
         return new Step.Continue(b.build());
     }
 
-    private Step closeTurn(RunState s, RunDeps d) {
-        Optional<RunOutcome> tripped = checkpoint(s, d);                              // ck4
-        if (tripped.isPresent()) return abort(s, d, tripped.get());
-
-        var b = s.toBuilder();
+    private Step closeTurn(RunState.Builder b, RunDeps d) {
+        Optional<RunOutcome> tripped = checkpoint(b, d);
+        if (tripped.isPresent()) return abort(b, d, tripped.get());
         List<AgentMessage> steering = d.steering().get();
         b.pendingInjection.addAll(steering);
-        boolean anotherTurn = !steering.isEmpty() || !s.turn().calls().isEmpty();
-        if (anotherTurn) {
+        if (!steering.isEmpty() || !b.turn.calls().isEmpty()) {
             b.turnIndex++;
             b.phase = Phase.TURN_OPENING;
         } else {
@@ -255,46 +265,44 @@ public final class RunEngine {
         return new Step.Continue(b.build());
     }
 
-    private Step followUp(RunState s, RunDeps d) {
-        Optional<RunOutcome> tripped = checkpoint(s, d);                              // ck5
-        if (tripped.isPresent()) return abort(s, d, tripped.get());
-
-        var b = s.toBuilder();
+    private Step followUp(RunState.Builder b, RunDeps d) {
+        Optional<RunOutcome> tripped = checkpoint(b, d);
+        if (tripped.isPresent()) return abort(b, d, tripped.get());
         List<AgentMessage> followUps = d.followUps().get();
         if (!followUps.isEmpty()) {
             b.pendingInjection.addAll(followUps);
             b.turnIndex++;
             b.phase = Phase.TURN_OPENING;
         } else {
-            b.outcome = outcomeOf(s.turn().assistant());
+            b.outcome = outcomeOf(b.turn.assistant());
             b.phase = Phase.FINISHED;
         }
         return new Step.Continue(b.build());
     }
 
-    private Step finish(RunState s, RunDeps d) {
-        RunOutcome outcome = s.outcome() != null ? s.outcome() : new RunOutcome.Completed(StopReason.STOP);
-        emitRunEnd(s, outcome, d);
-        return new Step.Done(s, outcome);
+    private Step finish(RunState.Builder b, RunDeps d) {
+        if (b.outcome == null) b.outcome = new RunOutcome.Completed(StopReason.STOP);
+        RunState state = b.build();
+        emitRunEnd(state, b.outcome, d);
+        return new Step.Done(state, b.outcome);
     }
 
     // ---- abort and checkpoints ----------------------------------------------------------------
 
-    /// The abort path: an open turn is closed through the machine (unfilled slots padded), then
-    /// the run finishes with `outcome`. Open `ToolStart`s were already completed by the funnel.
-    private Step abort(RunState s, RunDeps d, RunOutcome outcome) {
-        var b = s.toBuilder();
-        if (s.turnOpen()) b.turn = step(s.turn(), new StepInput.Cancel(), b, d).state();
+    /// Close the current turn before finishing; the funnel owns any announced ToolEnd.
+    private Step abort(RunState.Builder b, RunDeps d, RunOutcome outcome) {
+        if (b.turn != null && b.turn.phase() != TurnPhase.CLOSED) step(b.turn, new StepInput.Cancel(), b, d);
         b.outcome = outcome;
         b.phase = Phase.FINISHED;
         return new Step.Continue(b.build());
     }
 
-    private static Optional<RunOutcome> checkpoint(RunState s, RunDeps d) {
-        if (d.cancel().isCancelled()) return Optional.of(new RunOutcome.Aborted());
-        return s.limits().wallClock()
-                .filter(limit -> now(d).isAfter(s.startedAt().plus(limit)))
+    private static Optional<RunOutcome> checkpoint(RunState.Builder b, RunDeps d) {
+        Optional<RunOutcome> expired = b.limits.wallClock()
+                .filter(limit -> !now(d).isBefore(b.startedAt.plus(limit)))
                 .map(limit -> new RunOutcome.LimitExceeded(RunOutcome.Limit.WALL_CLOCK, "wall clock exceeded: " + limit));
+        return expired.isPresent() ? expired
+                : d.cancel().isCancelled() ? Optional.of(new RunOutcome.Aborted()) : Optional.empty();
     }
 
     private static RunOutcome outcomeOf(AssistantMessage last) {
@@ -330,6 +338,7 @@ public final class RunEngine {
 
     private StepOutcome step(TurnState turn, StepInput input, RunState.Builder b, RunDeps d) {
         StepOutcome out = machine.step(turn, input, now(d));
+        b.turn = out.state();
         if (out instanceof StepOutcome.Ignored(var reason, _)) LOG.log(System.Logger.Level.DEBUG, "turn machine ignored input: {0}", reason);
         apply(b, out.events(), d);
         return out;
@@ -338,8 +347,8 @@ public final class RunEngine {
     /// The transcript grows **only** at `MessageEnd`, and only here.
     private void apply(RunState.Builder b, List<AgentEvent> events, RunDeps d) {
         for (AgentEvent e : events) {
-            emit(e, d);
             if (e instanceof AgentEvent.MessageEnd(_, _, _, var message)) b.transcript.add(message);
+            emit(e, d);
         }
     }
 
@@ -349,7 +358,11 @@ public final class RunEngine {
     }
 
     private static void emit(AgentEvent e, RunDeps d) {
-        d.sink().emit(e);
+        try {
+            d.sink().emit(e);
+        } catch (RuntimeException failure) {
+            LOG.log(System.Logger.Level.WARNING, "event sink threw", failure);
+        }
         try {
             d.hooks().onEvent(e);
         } catch (Throwable t) {
@@ -361,15 +374,6 @@ public final class RunEngine {
         return new TurnContext(s.runId(), s.turnIndex(), s.transcript(), s.limits(), s.turnsUsed(), d.tools(), d.cancel(), d.clock());
     }
 
-    private static <T> T safely(Supplier<T> call, T fallback) {
-        try {
-            T value = call.get();
-            return value == null ? fallback : value;
-        } catch (Throwable t) {
-            LOG.log(System.Logger.Level.WARNING, "hook threw; using fallback", t);
-            return fallback;
-        }
-    }
 
     private static Instant now(RunDeps d) { return d.clock().instant(); }
 }

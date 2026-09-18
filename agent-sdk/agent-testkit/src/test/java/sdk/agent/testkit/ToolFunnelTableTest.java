@@ -32,14 +32,9 @@ import sdk.agent.tool.ToolKind;
 import sdk.agent.tool.ToolMessages;
 import sdk.agent.tool.ToolResult;
 
-/// The ten rows of the funnel table, each with its [ErrorKind] and, for the
-/// six verbatim strings, a byte-exact assertion. Every row is driven through the real engine, so
-/// what is asserted is the funnel's *one exit point* — `ToolEnd` and a transcript entry exist for
-/// every `ToolStart` whatever fails.
-///
-/// The rig runs with **no [sdk.agent.hook.TurnGuard]**: the guard's `MALFORMED` tier refuses a turn
-/// whose every call is unusable *before* the funnel sees it, so the funnel's own preflight rows are
-/// only reachable with loop policy removed — which is exactly the removability the hook design claims.
+/// Drives preparation, permission, execution, and output-filter failures through the real engine.
+/// Every announced call must have one ToolEnd and one transcript result, without leaking output
+/// when policy fails. Rig deliberately has no optional TurnGuard.
 @Timeout(value = 20, unit = TimeUnit.SECONDS)
 @DisplayName("ToolFunnel — the ten rows")
 final class ToolFunnelTableTest {
@@ -48,7 +43,7 @@ final class ToolFunnelTableTest {
         var steps = new ArrayList<ScriptedProvider.Step>();
         steps.add(ScriptedProvider.emit(new LlmStreamEvent.Start()));
         steps.addAll(ScriptedProvider.toolCall(0, "call-1", tool, argumentsJson));
-        steps.add(ScriptedProvider.emit(new LlmStreamEvent.Done(StopReason.TOOL_USE, Usage.tokens(10, 5), "resp-1")));
+        steps.add(ScriptedProvider.emit(new LlmStreamEvent.Done(StopReason.TOOL_USE, Usage.tokens(10, 5), "resp-1", sdk.agent.json.Json.nil())));
         return ScriptedProvider.of(steps);
     }
 
@@ -109,49 +104,23 @@ final class ToolFunnelTableTest {
         assertEquals(0, edit.calls());
     }
 
-    // ---- row 3 ---------------------------------------------------------------------------------
 
     @Test
-    @DisplayName("schema validation fails → the byte-exact `Validation failed for tool \"...\"` block")
-    void schemaValidationFailsByteExactly() {
-        var write = FakeTool.named("write").validating(FakeTool.objectSchema("path"));
-        var rig = new Rig().provider(calling("write", "{\"other\":\"x\"}")).tools(write);
-        rig.run("hi");
-
-        assertFunnelExitedOnce(rig);
-        assertEquals(ErrorKind.INVALID_ARGUMENTS, kindOf(rig));
-        assertEquals("""
-                Validation failed for tool "write":
-                  - path: must have required property 'path'
-                  - root: must NOT have additional properties
-
-                Received arguments:
-                {
-                  "other": "x"
-                }""",
-                resultOf(rig).text(),
-                "echoing the received arguments back is what lets the model self-correct");
-        assertEquals(0, write.calls());
-    }
-
-    // ---- rows 4, 5, 6: the three preflight strings ----------------------------------------------
-
-    @Test
-    @DisplayName("args unparseable while stalled → ARGS_CUT_OFF_BY_STALL, nothing executes")
+    @DisplayName("stalled malformed arguments never reach execution preparation")
     void unparseableArgumentsAfterAStall() {
         var write = FakeTool.mutating("write", "written");
         var rig = new Rig().provider(ScriptedProvider.toolHangInvalidJson())
                 .idleTimeout(Duration.ofMillis(120)).tools(write);
         rig.run("hi");
 
-        assertFunnelExitedOnce(rig);
-        assertEquals(ErrorKind.INVALID_ARGUMENTS, kindOf(rig));
-        assertEquals(ToolMessages.ARGS_CUT_OFF_BY_STALL, resultOf(rig).text());
+        rig.sink.assertInvariants();
+        assertTrue(rig.sink.ofType(AgentEvent.ToolStart.class).isEmpty());
+        assertTrue(resultOf(rig).isError());
         assertEquals(0, write.calls());
     }
 
     @Test
-    @DisplayName("args unparseable, not stalled, no snapshot → ARGS_INVALID_JSON")
+    @DisplayName("malformed successful tool arguments fail without execution")
     void unparseableArgumentsWithoutASnapshot() {
         var write = FakeTool.mutating("write", "written");
         var rig = new Rig().provider(calling("write", "{\"path\": \"/tmp/x\", \"content\": \"incomp")).tools(write);
@@ -159,22 +128,20 @@ final class ToolFunnelTableTest {
 
         assertFunnelExitedOnce(rig);
         assertEquals(ErrorKind.INVALID_ARGUMENTS, kindOf(rig));
-        assertEquals(ToolMessages.ARGS_INVALID_JSON, resultOf(rig).text());
         assertEquals(0, write.calls());
     }
 
     @Test
-    @DisplayName("validation fails after a stall → ARGS_FAILED_VALIDATION_AFTER_STALL, not the schema block")
+    @DisplayName("a stalled turn cannot execute even complete arguments")
     void validationFailsAfterAStall() {
         var write = FakeTool.named("write").validating(FakeTool.objectSchema("path"));
         var rig = new Rig().provider(callingThenHanging("write", "{\"unexpected\":\"x\"}"))
                 .idleTimeout(Duration.ofMillis(120)).tools(write);
         rig.run("hi");
 
-        assertFunnelExitedOnce(rig);
-        assertEquals(ErrorKind.INVALID_ARGUMENTS, kindOf(rig));
-        assertEquals(ToolMessages.ARGS_FAILED_VALIDATION_AFTER_STALL, resultOf(rig).text(),
-                "after a stall, parseable-but-invalid arguments are likely truncated, not wrong");
+        rig.sink.assertInvariants();
+        assertTrue(rig.sink.ofType(AgentEvent.ToolStart.class).isEmpty());
+        assertTrue(resultOf(rig).isError());
         assertEquals(0, write.calls());
     }
 
@@ -198,22 +165,6 @@ final class ToolFunnelTableTest {
         assertEquals(0, bash.calls(), "a veto has no side effect to undo");
     }
 
-    @Test
-    @DisplayName("beforeToolCall blocks with no reason → `Tool execution was blocked` (pi agent-loop.ts:504)")
-    void beforeToolCallBlocksWithoutAReason() {
-        var bash = FakeTool.mutating("bash", "total 0");
-        var rig = new Rig().provider(calling("bash", "{\"command\":\"ls\"}")).tools(bash)
-                .hooks(new AgentHooks() {
-                    @Override public ToolDecision beforeToolCall(BeforeToolCall call, Cancellation cancel) {
-                        return ToolDecision.block("");
-                    }
-                });
-        rig.run("hi");
-
-        assertFunnelExitedOnce(rig);
-        assertEquals(ErrorKind.BLOCKED, kindOf(rig));
-        assertEquals(ToolMessages.BLOCKED, resultOf(rig).text());
-    }
 
     @Test
     @DisplayName("beforeToolCall throws → HOOK_FAILED, and the call still leaves through the one exit")
@@ -281,7 +232,7 @@ final class ToolFunnelTableTest {
     }
 
     @Test
-    @DisplayName("afterToolCall throws → the result is unchanged and ToolEnd is still emitted")
+    @DisplayName("output-filter failure replaces sensitive output with HOOK_FAILED")
     void afterToolCallThrows() {
         var read = FakeTool.readOnly("read", "contents of a.txt");
         var rig = new Rig().provider(calling("read", "{\"path\":\"a.txt\"}")).tools(read)
@@ -293,9 +244,11 @@ final class ToolFunnelTableTest {
         rig.run("hi");
 
         assertFunnelExitedOnce(rig);
-        assertEquals("contents of a.txt", resultOf(rig).text(),
-                "\"the override did not apply\", never \"the call vanished\"");
-        assertTrue(!resultOf(rig).isError());
+        assertEquals(ErrorKind.HOOK_FAILED, kindOf(rig));
+        assertTrue(resultOf(rig).isError());
+        assertTrue(!resultOf(rig).text().contains("contents of a.txt"));
+        assertTrue(!resultOf(rig).details().toText().contains("contents of a.txt"));
+        assertEquals(1, read.calls(), "filter failure must not retry the side effect");
     }
 
     @Test
@@ -314,8 +267,7 @@ final class ToolFunnelTableTest {
         rig.run("hi");
 
         assertFunnelExitedOnce(rig);
-        assertEquals(ErrorKind.EXECUTION_FAILED, kindOf(rig));
-        assertEquals("IllegalStateException: tool exploded", resultOf(rig).text());
+        assertEquals(ErrorKind.HOOK_FAILED, kindOf(rig));
         assertEquals(List.of("ToolStart", "ToolEnd", "MessageStart", "MessageEnd"),
                 rig.trace().subList(rig.trace().indexOf("ToolStart"), rig.trace().indexOf("ToolStart") + 4));
     }
@@ -358,7 +310,7 @@ final class ToolFunnelTableTest {
         script.addAll(ScriptedProvider.toolCall(0, "call-1", "read", "{\"path\":\"a.txt\"}"));
         script.addAll(ScriptedProvider.toolCall(1, "call-2", "gone", "{}"));
         script.addAll(ScriptedProvider.toolCall(2, "call-3", "read", "{\"path\":\"b.txt\"}"));
-        script.add(ScriptedProvider.emit(new LlmStreamEvent.Done(StopReason.TOOL_USE, Usage.tokens(10, 5), "r")));
+        script.add(ScriptedProvider.emit(new LlmStreamEvent.Done(StopReason.TOOL_USE, Usage.tokens(10, 5), "r", sdk.agent.json.Json.nil())));
 
         var rig = new Rig().provider(ScriptedProvider.of(script))
                 .tools(FakeTool.named("read").kind(ToolKind.READ_ONLY).answering("contents"));

@@ -4,10 +4,8 @@ import java.util.Objects;
 
 import sdk.agent.message.ContentBlock;
 
-/// The one content block currently open on the stream; at most one at a time. Appends are pure. A
-/// delta is opaque and is never inspected before [#close]. `text + delta` is O(n) per delta, which
-/// for a response measured in tens of kilobytes is unmeasurable next to the network; a
-/// `StringBuilder` inside a record that must serialise at every checkpoint is not a trade worth making.
+/// An immutable, indexed text or thinking accumulator. Appending copies the current text;
+/// this keeps transitions pure but is an explicit per-delta allocation cost.
 public record OpenBlock(Kind kind, int index, String text, String signature, boolean redacted) {
 
     public enum Kind { TEXT, THINKING }

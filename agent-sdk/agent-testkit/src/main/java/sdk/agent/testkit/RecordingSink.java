@@ -21,16 +21,10 @@ import sdk.agent.message.ToolResultMessage;
 /// JUnit, from a host's own harness and from a `main`. Recording is thread-safe because a parallel
 /// tool batch emits `ToolUpdate` from several virtual threads at once.
 ///
-/// **Two invariants are weaker here than their one-line statement, and deliberately so.**
-///  * I10 (`toolCalls().size() == toolResults().size()`) holds for a turn that *ran* tools. The
-///    `Stop`/`Retry` verdicts emit `TurnEnd(assistant, [])` for an assistant that may carry
-///    tool-call blocks — a malformed batch is refused before any `ToolStart`. So the check is:
-///    a turn with any `ToolStart` must be fully index-aligned; a turn with none must have no
-///    results at all.
-///  * I9 (no interleaving with steering) is checked as: once a turn has announced a tool call, no
-///    message other than a `ToolResultMessage` may appear before its `TurnEnd`. A `Stop` verdict's
-///    own message is emitted between the assistant `MessageEnd` and the `TurnEnd` by design, and
-///    that turn never ran a tool.
+/// Every closed turn must carry one result message per assistant tool call, including calls that
+/// were never prepared for execution and therefore receive `ToolMessages.NOT_EXECUTED` padding.
+/// The sink also checks ordering and framing, so it remains useful for pure-machine tests and
+/// host integration traces.
 public final class RecordingSink implements EventSink {
 
     private final Object lock = new Object();
@@ -128,15 +122,13 @@ public final class RecordingSink implements EventSink {
         private boolean openMessageIsAssistant;
 
         private boolean turnOpen;
-        private boolean assistantClosed;                       // this turn's assistant MessageEnd seen
-        private boolean turnAnnouncedATool;                    // any ToolStart in this turn
-        private final List<String> resultsInTurn = new ArrayList<>();
-
-        private final Set<String> openTools = new LinkedHashSet<>();
-        private final Set<String> seenTools = new LinkedHashSet<>();
-
-        private String awaitingResultStart;                    // I6: the id a MessageStart must carry
+        private String awaitingResultStart;
         private String awaitingResultEnd;
+        private final Set<String> seenTools = new LinkedHashSet<>();
+        private final Set<String> openTools = new LinkedHashSet<>();
+        private boolean assistantClosed;                       // this turn's assistant MessageEnd seen
+        private boolean turnHasCalls;
+        private final List<String> resultsInTurn = new ArrayList<>();
 
         Walk(List<AgentEvent> all) { this.all = all; }
 
@@ -163,7 +155,7 @@ public final class RecordingSink implements EventSink {
                     if (turnOpen) throw fail("I8", "a TurnEnd before the next TurnStart", "a nested TurnStart", i, all);
                     turnOpen = true;
                     assistantClosed = false;
-                    turnAnnouncedATool = false;
+                    turnHasCalls = false;
                     resultsInTurn.clear();
                 }
 
@@ -189,7 +181,10 @@ public final class RecordingSink implements EventSink {
                         throw fail("I3", "MessageEnd of the message that was started", "MessageEnd of a different message", i, all);
                     }
                     if (message instanceof ToolResultMessage r) resultsInTurn.add(r.toolCallId());
-                    if (turnOpen && message instanceof AssistantMessage) assistantClosed = true;
+                    if (turnOpen && message instanceof AssistantMessage a) {
+                        assistantClosed = true;
+                        turnHasCalls = !a.toolCalls().isEmpty();
+                    }
                     openMessage = null;
                     openMessageIsAssistant = false;
                 }
@@ -205,7 +200,6 @@ public final class RecordingSink implements EventSink {
                 case AgentEvent.ToolStart(_, _, _, var id, _, _) -> {
                     if (!seenTools.add(id)) throw fail("I5", "one ToolStart per tool call id", "a second ToolStart for " + id, i, all);
                     openTools.add(id);
-                    turnAnnouncedATool = true;
                 }
 
                 case AgentEvent.ToolUpdate(_, _, _, var id, _, _) -> {
@@ -221,9 +215,9 @@ public final class RecordingSink implements EventSink {
             }
         }
 
-        /// I9 — once a turn has announced a tool call, only tool results may follow until `TurnEnd`.
+        /// Once an assistant has announced calls, only tool-result messages may precede TurnEnd.
         private void checkSteeringIsolation(int i, AgentMessage message) {
-            if (!turnOpen || !assistantClosed || !turnAnnouncedATool) return;
+            if (!turnOpen || !assistantClosed || !turnHasCalls) return;
             if (message instanceof ToolResultMessage) return;
             throw fail("I9", "only ToolResultMessages between an assistant message and its TurnEnd",
                     "a " + message.kind() + " message", i, all);
@@ -231,14 +225,13 @@ public final class RecordingSink implements EventSink {
 
         private void checkTurnEnd(int i, AssistantMessage assistant, List<ToolResultMessage> results) {
             List<ContentBlock.ToolCall> calls = assistant.toolCalls();
-            if (!turnAnnouncedATool) {
+            if (calls.isEmpty()) {
                 if (!results.isEmpty()) {
-                    throw fail("I7", "no tool results in a turn that announced no tool call",
+                    throw fail("I7", "no tool results in a turn with no tool calls",
                             results.size() + " result(s)", i, all);
                 }
                 return;
             }
-            // I10 — index-aligned, sized from toolCalls.
             if (results.size() != calls.size()) {
                 throw fail("I10", calls.size() + " tool results (one per tool call)", results.size() + " of them", i, all);
             }
@@ -248,14 +241,12 @@ public final class RecordingSink implements EventSink {
                             results.get(k).toolCallId(), i, all);
                 }
             }
-            // I7 — exactly the results emitted since the assistant's MessageEnd.
             Set<String> emitted = new LinkedHashSet<>(resultsInTurn);
             Set<String> carried = new LinkedHashSet<>(results.stream().map(ToolResultMessage::toolCallId).toList());
             if (!emitted.equals(carried)) {
                 throw fail("I7", "TurnEnd.toolResults to be exactly the results emitted in this turn " + emitted,
                         carried.toString(), i, all);
             }
-            // I11 — emitted in assistant source order.
             List<String> sourceOrder = calls.stream().map(ContentBlock.ToolCall::id).filter(emitted::contains).toList();
             if (!sourceOrder.equals(resultsInTurn)) {
                 throw fail("I11", "tool results in assistant source order " + sourceOrder, resultsInTurn.toString(), i, all);

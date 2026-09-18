@@ -1,8 +1,7 @@
 package sdk.agent.tool;
 
-/// Every model-facing string the engine itself can put into a tool result, in one place. Six are
-/// verbatim from pi-mono, kon and mini-swe-agent (MIT — see THIRD-PARTY-NOTICES.md); they are
-/// prompt text tuned against real models, and the loop is where they belong.
+/// Model-facing engine tool-result strings. Attributed prompt text is retained where the
+/// corresponding behavior remains useful; see THIRD-PARTY-NOTICES.md.
 public final class ToolMessages {
 
     private ToolMessages() { }
@@ -23,14 +22,7 @@ public final class ToolMessages {
     public static final String NO_OUTPUT = "(no output)";
 
     /// kon `turn.py:145-204`, verbatim.
-    public static final String ARGS_CUT_OFF_BY_STALL =
-            "Tool call arguments were cut off when the stream stalled; skipping execution instead of running with truncated arguments.";
-
-    /// kon `turn.py:145-204`, verbatim.
     public static final String ARGS_INVALID_JSON =
             "Tool call arguments were incomplete or invalid JSON; skipping execution instead of running with empty arguments.";
 
-    /// kon `turn.py:145-204`, verbatim.
-    public static final String ARGS_FAILED_VALIDATION_AFTER_STALL =
-            "Tool call arguments failed validation after the stream stalled mid-call, so they are likely incomplete; skipping execution.";
 }

@@ -58,7 +58,7 @@ public final class ScriptedProvider implements LlmProvider {
             emit(new LlmStreamEvent.TextStart(0)),
             emit(new LlmStreamEvent.TextDelta(0, "Done.")),
             emit(new LlmStreamEvent.TextEnd(0, "Done.", null)),
-            emit(new LlmStreamEvent.Done(StopReason.STOP, Usage.tokens(8, 2), "scripted-stop")));
+            emit(new LlmStreamEvent.Done(StopReason.STOP, Usage.tokens(8, 2), "scripted-stop", Json.nil())));
 
     private final List<List<Step>> scripts;
     private final AtomicInteger opens = new AtomicInteger();
@@ -178,7 +178,7 @@ public final class ScriptedProvider implements LlmProvider {
                 emit(new LlmStreamEvent.ToolCallDelta(2, "{\"path\":\"file.txt\"}", false)),
                 emit(new LlmStreamEvent.ToolCallStart(3, "call-2", "bash", Json.Obj.EMPTY)),
                 emit(new LlmStreamEvent.ToolCallDelta(3, "{\"command\":\"ls -la\"}", false)),
-                emit(new LlmStreamEvent.Done(StopReason.TOOL_USE, Usage.tokens(120, 40), "resp-default"))));
+                emit(new LlmStreamEvent.Done(StopReason.TOOL_USE, Usage.tokens(120, 40), "resp-default", Json.nil()))));
     }
 
     /// **2.** One text block, `Done(STOP)`. Pins the minimal turn: `STOP` is not promoted to a
@@ -189,7 +189,7 @@ public final class ScriptedProvider implements LlmProvider {
                 emit(new LlmStreamEvent.TextStart(0)),
                 emit(new LlmStreamEvent.TextDelta(0, "Hello, world!")),
                 emit(new LlmStreamEvent.TextEnd(0, "Hello, world!", null)),
-                emit(new LlmStreamEvent.Done(StopReason.STOP, Usage.tokens(10, 5), "resp-simple"))));
+                emit(new LlmStreamEvent.Done(StopReason.STOP, Usage.tokens(10, 5), "resp-simple", Json.nil()))));
     }
 
     /// **3.** Thinking → text → one `read` call. Pins block-order finalisation: THINK, TEXT, TOOL,
@@ -205,7 +205,7 @@ public final class ScriptedProvider implements LlmProvider {
                 emit(new LlmStreamEvent.TextEnd(1, "Looking now.", null)),
                 emit(new LlmStreamEvent.ToolCallStart(2, "call-1", "read", Json.Obj.EMPTY)),
                 emit(new LlmStreamEvent.ToolCallDelta(2, "{\"path\":\"file.txt\"}", false)),
-                emit(new LlmStreamEvent.Done(StopReason.TOOL_USE, Usage.tokens(90, 30), "resp-ttt"))));
+                emit(new LlmStreamEvent.Done(StopReason.TOOL_USE, Usage.tokens(90, 30), "resp-ttt", Json.nil()))));
     }
 
     /// **4.** Two retryable open failures, then the happy text turn. Pins that provider-side retry
@@ -250,7 +250,7 @@ public final class ScriptedProvider implements LlmProvider {
                 emit(new LlmStreamEvent.Start()),
                 emit(new LlmStreamEvent.ToolCallStart(0, "call-1", "unknown_tool", Json.Obj.EMPTY)),
                 emit(new LlmStreamEvent.ToolCallDelta(0, "{\"whatever\":1}", false)),
-                emit(new LlmStreamEvent.Done(StopReason.TOOL_USE, Usage.tokens(20, 8), "resp-unknown"))));
+                emit(new LlmStreamEvent.Done(StopReason.TOOL_USE, Usage.tokens(20, 8), "resp-unknown", Json.nil()))));
     }
 
     /// **9.** Six text deltas. Pins delta accumulation and exactly one `TextEnd`.
@@ -265,12 +265,12 @@ public final class ScriptedProvider implements LlmProvider {
             steps.add(emit(new LlmStreamEvent.TextDelta(0, piece)));
         }
         steps.add(emit(new LlmStreamEvent.TextEnd(0, text.toString(), null)));
-        steps.add(emit(new LlmStreamEvent.Done(StopReason.STOP, Usage.tokens(30, 60), "resp-long")));
+        steps.add(emit(new LlmStreamEvent.Done(StopReason.STOP, Usage.tokens(30, 60), "resp-long", Json.nil())));
         return of(steps);
     }
 
-    /// **10.** A `read` call whose arguments are **complete**, then a hang. Pins that a stall with
-    /// valid JSON still yields a usable call — the stall flag alone must not veto execution.
+    /// **10.** Complete `read` arguments followed by a hang. The diagnostic call is retained,
+    /// but the failed turn cannot execute it.
     public static ScriptedProvider toolHang() {
         return of(List.of(
                 emit(new LlmStreamEvent.Start()),
@@ -283,7 +283,7 @@ public final class ScriptedProvider implements LlmProvider {
     }
 
     /// **11.** A `write` call cut off mid-JSON, then a hang, with **no** start snapshot. Pins the
-    /// stalled preflight string and that nothing executes.
+    /// null-argument result and proves that nothing executes.
     public static ScriptedProvider toolHangInvalidJson() {
         return of(List.of(
                 emit(new LlmStreamEvent.Start()),
@@ -292,10 +292,8 @@ public final class ScriptedProvider implements LlmProvider {
                 hang()));
     }
 
-    /// **12. The stale-snapshot trap.** A `write` whose `initialArguments` name `/tmp/stale.txt`,
-    /// then a truncated `replace = true` delta, then a hang. Pins that the fallback to
-    /// `initialArguments` is **suppressed when the stream stalled** — otherwise the engine writes
-    /// the stale path. The single subtlest rule in the engine.
+    /// **12.** A stale initial snapshot followed by malformed replacement fragments and a hang.
+    /// Received fragments are authoritative; malformed JSON never falls back to the snapshot.
     public static ScriptedProvider toolHangWithInitialArgs() {
         return of(List.of(
                 emit(new LlmStreamEvent.Start()),
@@ -305,8 +303,7 @@ public final class ScriptedProvider implements LlmProvider {
                 hang()));
     }
 
-    /// **13.** A `bash` call assembled from 24 small fragments. Pins assembler correctness across
-    /// many deltas — nothing but end of stream, a stall or a cancel flushes the accumulator.
+    /// **13.** A `bash` call assembled from 24 small fragments.
     public static ScriptedProvider toolWithManyChunks() {
         String arguments = "{\"command\":\"echo hello from twenty four chunks\"}";
         var steps = new ArrayList<Step>();
@@ -315,12 +312,11 @@ public final class ScriptedProvider implements LlmProvider {
         for (String fragment : split(arguments, 24)) {
             steps.add(emit(new LlmStreamEvent.ToolCallDelta(0, fragment, false)));
         }
-        steps.add(emit(new LlmStreamEvent.Done(StopReason.TOOL_USE, Usage.tokens(55, 25), "resp-chunks")));
+        steps.add(emit(new LlmStreamEvent.Done(StopReason.TOOL_USE, Usage.tokens(55, 25), "resp-chunks", Json.nil())));
         return of(steps);
     }
 
-    /// **14.** Whitespace-only text, then thinking, then real text. Pins that a blank text block
-    /// never opens a TEXT block in the finalised message.
+    /// **14.** Whitespace-only text, thinking, then text; every indexed block is preserved.
     public static ScriptedProvider leadingEmptyTextThenThink() {
         return of(List.of(
                 emit(new LlmStreamEvent.Start()),
@@ -333,11 +329,10 @@ public final class ScriptedProvider implements LlmProvider {
                 emit(new LlmStreamEvent.TextStart(2)),
                 emit(new LlmStreamEvent.TextDelta(2, "Hello, world!")),
                 emit(new LlmStreamEvent.TextEnd(2, "Hello, world!", null)),
-                emit(new LlmStreamEvent.Done(StopReason.STOP, Usage.tokens(12, 6), "resp-blank-think"))));
+                emit(new LlmStreamEvent.Done(StopReason.STOP, Usage.tokens(12, 6), "resp-blank-think", Json.nil()))));
     }
 
-    /// **15.** Whitespace-only text, then real text. Same rule, and the real block still opens
-    /// cleanly at index 1.
+    /// **15.** Whitespace-only text and a separate text block at index 1.
     public static ScriptedProvider leadingEmptyTextThenText() {
         return of(List.of(
                 emit(new LlmStreamEvent.Start()),
@@ -347,7 +342,7 @@ public final class ScriptedProvider implements LlmProvider {
                 emit(new LlmStreamEvent.TextStart(1)),
                 emit(new LlmStreamEvent.TextDelta(1, "Hello, world!")),
                 emit(new LlmStreamEvent.TextEnd(1, "Hello, world!", null)),
-                emit(new LlmStreamEvent.Done(StopReason.STOP, Usage.tokens(12, 6), "resp-blank-text"))));
+                emit(new LlmStreamEvent.Done(StopReason.STOP, Usage.tokens(12, 6), "resp-blank-text", Json.nil()))));
     }
 
     /// **16.** A normal turn whose `Done` carries usage above a typical `contextWindow - reserved`.
@@ -373,7 +368,7 @@ public final class ScriptedProvider implements LlmProvider {
                 emit(new LlmStreamEvent.TextDelta(1, "writing it now")),
                 emit(new LlmStreamEvent.TextEnd(1, "writing it now", null)),
                 emit(new LlmStreamEvent.ToolCallDelta(0, "\"content\":\"hi\"}", false)),
-                emit(new LlmStreamEvent.Done(StopReason.TOOL_USE, Usage.tokens(44, 18), "resp-interleaved"))));
+                emit(new LlmStreamEvent.Done(StopReason.TOOL_USE, Usage.tokens(44, 18), "resp-interleaved", Json.nil()))));
     }
 
     /// The `Usage` scenario 16 reports: an input count that overruns a 200k window less a reserve.
@@ -385,7 +380,7 @@ public final class ScriptedProvider implements LlmProvider {
                 emit(new LlmStreamEvent.TextStart(0)),
                 emit(new LlmStreamEvent.TextDelta(0, "That is everything I have room for.")),
                 emit(new LlmStreamEvent.TextEnd(0, "That is everything I have room for.", null)),
-                emit(new LlmStreamEvent.Done(StopReason.STOP, OVERFLOW_USAGE, "resp-overflow")));
+                emit(new LlmStreamEvent.Done(StopReason.STOP, OVERFLOW_USAGE, "resp-overflow", Json.nil())));
     }
 
     /// A tool call built by hand, for scripts a test assembles itself.

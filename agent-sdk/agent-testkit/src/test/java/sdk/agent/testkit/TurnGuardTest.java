@@ -62,7 +62,7 @@ final class TurnGuardTest {
         var content = new ArrayList<ContentBlock>();
         if (!text.isEmpty()) content.add(ContentBlock.Text.of(text));
         content.addAll(List.of(calls));
-        return new AssistantMessage(content, MODEL, "r", Usage.EMPTY, reason, null, NOW);
+        return new AssistantMessage(content, MODEL, "r", Usage.EMPTY, reason, null, sdk.agent.json.Json.nil(), NOW);
     }
 
     private static ContentBlock.ToolCall call(String id, String name, Json arguments) {
@@ -114,7 +114,7 @@ final class TurnGuardTest {
                 () -> assertEquals(1, request.messages().size(), "the instruction is transient: one request only"));
     }
 
-    // ---- the four reprompt tiers -----------------------------------------------------------------
+    // ---- response-quality tiers ------------------------------------------------------------------
 
     @Test
     @DisplayName("EMPTY: Retry(CONTINUE_NUDGE), then Stop(THRASH) at the cap of 2")
@@ -136,6 +136,15 @@ final class TurnGuardTest {
     }
 
     @Test
+    @DisplayName("LENGTH with calls retries so incomplete calls are not executed")
+    void lengthWithCallsRetries() {
+        var verdict = guard.afterAssistant(message(StopReason.LENGTH, "",
+                call("c1", "write", Json.obj("path", Json.str("a.txt")))), ctx(1));
+        assertEquals(TurnGuard.TRUNCATED_TURN_INSTRUCTION, repromptOf(verdict));
+        assertEquals("truncated", ((TurnVerdict.Retry) verdict).reason());
+    }
+
+    @Test
     @DisplayName("TRUNCATED: TOOL_USE with no call block at all → STOPPED_WITHOUT_TOOL_CALL_INSTRUCTION")
     void toolUseWithNoCallBlockIsATruncationNotAFormatError() {
         String reprompt = repromptOf(guard.afterAssistant(message(StopReason.TOOL_USE, "I will now run"), ctx(1)));
@@ -146,40 +155,11 @@ final class TurnGuardTest {
     }
 
     @Test
-    @DisplayName("MALFORMED: an unknown name, Json.Null arguments and a schema rejection all reach the same tier")
-    void malformedCoversAllThreeUnusableShapes() {
-        String unknown = repromptOf(guard.afterAssistant(
-                message(StopReason.TOOL_USE, "", call("c1", "no_such_tool", Json.Obj.EMPTY)), ctx(1)));
-        assertAll(
-                () -> assertTrue(unknown.startsWith("Your previous response contained a malformed tool call.")),
-                () -> assertTrue(unknown.contains("<error>") && unknown.contains("</error>")),
-                () -> assertTrue(unknown.contains("there is no tool named `no_such_tool`")),
-                () -> assertTrue(unknown.contains("Available tools: read, bash, alpha, beta, write")));
-
-        var freshGuard = TurnGuard.defaults();
-        String nullArgs = repromptOf(freshGuard.afterAssistant(
-                message(StopReason.TOOL_USE, "", call("c1", "read", Json.Null.NULL)), ctx(1)));
-        assertTrue(nullArgs.contains("the arguments were not valid JSON"),
-                "a native tool call with garbage arguments is invisible to nanocoder's XML-only counter");
-
-        var schemaGuard = TurnGuard.defaults();
-        String rejected = repromptOf(schemaGuard.afterAssistant(
-                message(StopReason.TOOL_USE, "", call("c1", "write", Json.obj("other", Json.str("x")))), ctx(1)));
-        assertAll(
-                () -> assertTrue(rejected.contains("Validation failed for tool \"write\"")),
-                () -> assertTrue(rejected.contains("Expected input schema for `write`:")),
-                () -> assertTrue(rejected.contains(FakeTool.objectSchema("path").toPrettyText()),
-                        "the schema itself goes back, or the model has nothing to correct against"),
-                () -> assertTrue(rejected.endsWith("Please try again using the correct format.")));
-    }
-
-    @Test
-    @DisplayName("a turn with ONE usable call among unusable ones is not malformed — the funnel reports the rest")
-    void oneUsableCallIsEnoughToProceed() {
+    @DisplayName("tool validity is left to the funnel, so mixed tool calls proceed")
+    void toolValidityIsNotGuardPolicy() {
         var verdict = guard.afterAssistant(message(StopReason.TOOL_USE, "",
                 call("c1", "no_such_tool", Json.Obj.EMPTY),
                 call("c2", "read", Json.obj("path", Json.str("a.txt")))), ctx(1));
-
         assertInstanceOf(TurnVerdict.Proceed.class, verdict);
     }
 
@@ -200,61 +180,20 @@ final class TurnGuardTest {
     }
 
     @Test
-    @DisplayName("SAME_TOOL: five consecutive calls to one tool, all with different arguments → Stop(THRASH)")
-    void sameToolFiveTimesStops() {
-        for (int i = 1; i <= 4; i++) {
-            var m = message(StopReason.TOOL_USE, "", call("c" + i, "read", Json.obj("path", Json.str("file" + i))));
-            assertInstanceOf(TurnVerdict.Proceed.class, guard.afterAssistant(m, ctx(i)),
-                    "different arguments must not trip the identical-batch tier");
+    @DisplayName("five distinct reads proceed without a tool-name-only heuristic")
+    void distinctReadsDoNotTripRepeatedBatch() {
+        for (int i = 1; i <= 5; i++) {
+            var m = message(StopReason.TOOL_USE, "",
+                    call("c" + i, "read", Json.obj("path", Json.str("file" + i))));
+            assertInstanceOf(TurnVerdict.Proceed.class, guard.afterAssistant(m, ctx(i)));
         }
-        var fifth = message(StopReason.TOOL_USE, "", call("c5", "read", Json.obj("path", Json.str("file5"))));
-        var stop = assertInstanceOf(TurnVerdict.Stop.class, guard.afterAssistant(fifth, ctx(5)));
-        assertEquals(new RunOutcome.LimitExceeded(RunOutcome.Limit.THRASH, "same tool on 5 consecutive calls"),
-                stop.outcome());
-    }
-
-    @Test
-    @DisplayName("DOMINANT: one signature 8 of the last 10 calls → Retry with a warning, never Stop")
-    void dominantSignatureRetriesRatherThanStopping() {
-        // Eight reads of the SAME file among ten calls, arranged so neither the identical-batch nor
-        // the same-tool tier fires first: counting tool NAMES here would abort eight reads of eight
-        // different files, the normal opening of any code task.
-        Json same = Json.obj("path", Json.str("hot.txt"));
-        var first = message(StopReason.TOOL_USE, "",
-                call("a1", "alpha", same), call("a2", "alpha", same), call("a3", "alpha", same), call("a4", "alpha", same),
-                call("b1", "beta", Json.obj("n", Json.str("1"))));
-        assertInstanceOf(TurnVerdict.Proceed.class, guard.afterAssistant(first, ctx(1)));
-
-        var second = message(StopReason.TOOL_USE, "",
-                call("a5", "alpha", same), call("a6", "alpha", same), call("a7", "alpha", same), call("a8", "alpha", same),
-                call("b2", "beta", Json.obj("n", Json.str("2"))));
-        var verdict = guard.afterAssistant(second, ctx(2));
-
-        var retry = assertInstanceOf(TurnVerdict.Retry.class, verdict);
-        assertEquals("dominant tool call signature", retry.reason());
-        assertEquals(TurnGuard.LOOP_DETECTED.formatted("alpha"), ((UserMessage) retry.message()).text());
     }
 
     // ---- the two counter rules -------------------------------------------------------------------
 
     @Test
-    @DisplayName("decay, not zeroing: alternating malformed/valid turns never trip a cap of 2 (mini-swe SWE-5)")
-    void alternatingMalformedAndValidNeverTrips() {
-        var malformed = message(StopReason.TOOL_USE, "", call("bad", "no_such_tool", Json.Obj.EMPTY));
-        String[] names = {"read", "bash"};
-
-        for (int cycle = 0; cycle < 4; cycle++) {
-            assertInstanceOf(TurnVerdict.Retry.class, guard.afterAssistant(malformed, ctx(cycle * 2 + 1)),
-                    "cycle " + cycle + ": a malformed turn is refused, never fatal on its own");
-            var valid = message(StopReason.TOOL_USE, "",
-                    call("ok" + cycle, names[cycle % 2], Json.obj("path", Json.str("f" + cycle))));
-            assertInstanceOf(TurnVerdict.Proceed.class, guard.afterAssistant(valid, ctx(cycle * 2 + 2)));
-        }
-    }
-
-    @Test
-    @DisplayName("zeroing on a different failure: alternating distinct failures never trip (nanocoder's cross-contamination fix)")
-    void alternatingDistinctFailuresNeverTrip() {
+    @DisplayName("alternating truncated and empty responses do not share a streak")
+    void alternatingResponseQualityFailuresDoNotTrip() {
         var empty = message(StopReason.STOP, "");
         var truncated = message(StopReason.LENGTH, "cut off here");
 
@@ -263,6 +202,7 @@ final class TurnGuardTest {
             assertEquals(TurnGuard.TRUNCATED_TURN_INSTRUCTION, repromptOf(guard.afterAssistant(truncated, ctx(cycle * 2 + 2))));
         }
     }
+
 
     @Test
     @DisplayName("the per-run window is dropped at RunEnd, so one guard serves many runs")

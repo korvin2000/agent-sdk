@@ -4,6 +4,8 @@ import java.time.Instant;
 import java.util.List;
 import java.util.Objects;
 
+import sdk.agent.json.Json;
+
 /// One assistant turn, complete. A failed turn is still a message — `stopReason` in
 /// `{ERROR, ABORTED}` plus `errorMessage` — never an exception (error-as-data).
 public record AssistantMessage(List<ContentBlock> content,
@@ -12,6 +14,7 @@ public record AssistantMessage(List<ContentBlock> content,
                                Usage usage,
                                StopReason stopReason,
                                String errorMessage,
+                               Json providerData,
                                Instant timestamp) implements Message {
 
     public AssistantMessage {
@@ -19,6 +22,7 @@ public record AssistantMessage(List<ContentBlock> content,
         Objects.requireNonNull(model, "model");
         Objects.requireNonNull(usage, "usage");
         Objects.requireNonNull(stopReason, "stopReason");
+        providerData = Objects.requireNonNullElse(providerData, Json.Null.NULL);
         Objects.requireNonNull(timestamp, "timestamp");
     }
 

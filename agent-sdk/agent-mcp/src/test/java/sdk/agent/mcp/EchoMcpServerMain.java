@@ -72,6 +72,14 @@ public final class EchoMcpServerMain {
                         .isError(true)
                         .build());
 
+        var structured = new McpServerFeatures.SyncToolSpecification(
+                McpSchema.Tool.builder("structured", EMPTY_SCHEMA)
+                        .description("Returns only structured content.")
+                        .build(),
+                (_, _) -> McpSchema.CallToolResult.builder()
+                        .structuredContent(Map.of("answer", 42))
+                        .build());
+
         var cwd = new McpServerFeatures.SyncToolSpecification(
                 McpSchema.Tool.builder("cwd", EMPTY_SCHEMA)
                         .description("Reports the server process working directory.")
@@ -83,7 +91,7 @@ public final class EchoMcpServerMain {
         McpServer.sync(new StdioServerTransportProvider(McpJsonDefaults.getMapper()))
                 .serverInfo("echo-mcp", "0.1.0")
                 .capabilities(McpSchema.ServerCapabilities.builder().tools(true).build())
-                .tools(echo, boom, cwd)
+                .tools(echo, boom, cwd, structured)
                 .build();
 
         new CountDownLatch(1).await();     // the client destroys this process on close

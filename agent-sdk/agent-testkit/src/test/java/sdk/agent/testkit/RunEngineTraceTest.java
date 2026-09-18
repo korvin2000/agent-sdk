@@ -22,11 +22,12 @@ import sdk.agent.RunLimits;
 import sdk.agent.RunResult;
 import sdk.agent.event.AgentEvent;
 import sdk.agent.event.RunOutcome;
+import sdk.agent.concurrent.Cancellation;
 import sdk.agent.hook.AgentHooks;
 import sdk.agent.hook.TurnContext;
-import sdk.agent.hook.TurnGuard;
+import sdk.agent.hook.TurnVerdict;
+import sdk.agent.provider.LlmRequest;
 import sdk.agent.provider.LlmProvider;
-import sdk.agent.json.Json;
 import sdk.agent.message.AgentMessage;
 import sdk.agent.message.AssistantMessage;
 import sdk.agent.message.StopReason;
@@ -420,26 +421,37 @@ final class RunEngineTraceTest {
     // ---- verdict short-circuits ------------------------------------------------------------------
 
     @Test
-    @DisplayName("a TurnGuard Retry closes the turn with no results and reprompts at the next opening")
-    void malformedTurnIsRetriedWithoutRunningAnything() {
-        var rig = new Rig().provider(ScriptedProvider.unknownTool()).hooks(TurnGuard.defaults());
+    void stopPadsBothCallsBeforeItsMessage() {
+        var rig = new Rig().provider(ScriptedProvider.defaultScenario()).hooks(new AgentHooks() {
+            @Override public TurnVerdict afterAssistant(AssistantMessage message, TurnContext ctx) {
+                return new TurnVerdict.Stop(new RunOutcome.Completed(StopReason.STOP),
+                        UserMessage.text("Stopped by host", ctx.clock().instant()));
+            }
+        });
         RunResult result = rig.run("hi");
-
         rig.sink.assertInvariants();
-        assertEquals(t().prompt()
-                        .e("TurnStart").assistant(2).e("TurnEnd")
-                        .e("MessageStart", "MessageEnd")            // the malformed-tool-call reprompt
-                        .fallbackTurn().e("RunEnd").list(),
-                rig.trace(),
-                "a batch with no usable call is refused before any ToolStart is announced");
+        assertEquals(List.of("user", "assistant", "toolResult", "toolResult", "user"), kinds(result.produced()));
+        assertTrue(rig.sink.ofType(AgentEvent.ToolStart.class).isEmpty());
+        assertEquals(List.of("call-1", "call-2"), rig.sink.ofType(AgentEvent.TurnEnd.class).getFirst()
+                .toolResults().stream().map(ToolResultMessage::toolCallId).toList());
+        assertEquals(1, rig.sink.ofType(AgentEvent.TurnEnd.class).size());
+    }
 
-        assertTrue(rig.sink.ofType(AgentEvent.ToolStart.class).isEmpty(), "a veto has no side effect to undo");
-        var turnEnd = rig.sink.ofType(AgentEvent.TurnEnd.class).getFirst();
-        assertEquals(1, turnEnd.message().toolCalls().size());
-        assertTrue(turnEnd.toolResults().isEmpty(),
-                "I10 is about a turn that RAN tools; the Stop/Retry rows emit TurnEnd(assistant, [])");
-        assertTrue(((UserMessage) result.produced().get(2)).text()
-                .startsWith("Your previous response contained a malformed tool call."));
+    @Test
+    void retryPadsBothCallsBeforeReprompt() {
+        var rig = new Rig().provider(ScriptedProvider.defaultScenario()).hooks(new AgentHooks() {
+            @Override public TurnVerdict afterAssistant(AssistantMessage message, TurnContext ctx) {
+                return message.toolCalls().isEmpty() ? TurnVerdict.PROCEED
+                        : new TurnVerdict.Retry(UserMessage.text("Try again", ctx.clock().instant()), "host policy");
+            }
+        });
+        RunResult result = rig.run("hi");
+        rig.sink.assertInvariants();
+        assertEquals(List.of("user", "assistant", "toolResult", "toolResult", "user", "assistant"),
+                kinds(result.produced()));
+        assertTrue(rig.sink.ofType(AgentEvent.ToolStart.class).isEmpty());
+        assertTrue(rig.sink.ofType(AgentEvent.TurnEnd.class).getFirst().toolResults().stream()
+                .allMatch(ToolResultMessage::isError));
     }
 
     @Test
@@ -507,16 +519,16 @@ final class RunEngineTraceTest {
     // ---- the stall path ------------------------------------------------------------------------
 
     @Test
-    @DisplayName("10: a hang with complete arguments stalls the turn but still executes the call")
-    void stalledTurnWithValidArgumentsStillExecutes() {
+    @DisplayName("a stalled turn with valid-looking arguments never executes")
+    void stalledTurnWithValidArgumentsCannotExecute() {
         var read = FakeTool.readOnly("read", "contents of file.txt");
         var rig = new Rig().provider(ScriptedProvider.toolHang()).idleTimeout(Duration.ofMillis(120)).tools(read);
         rig.run("hi");
 
         rig.sink.assertInvariants();
-        assertEquals(1, read.calls(), "a stall with valid JSON must not veto execution");
-        assertEquals(Json.obj("path", Json.str("file.txt")), read.arguments().getFirst());
-        assertEquals("contents of file.txt", rig.sink.toolResult("call-1").orElseThrow().text());
+        assertEquals(0, read.calls());
+        assertTrue(rig.sink.toolResult("call-1").orElseThrow().isError());
+        assertTrue(rig.sink.ofType(AgentEvent.ToolStart.class).isEmpty());
     }
 
     @Test
@@ -558,7 +570,7 @@ final class RunEngineTraceTest {
         rig.sink.assertInvariants();
         assertTrue(provider.allStreamsClosed(),
                 "close() is the pump's job on every path; a leaked stream is a leaked cancellation listener");
-        assertEquals(2, provider.opens(), "the tool turn and the closing turn each open one stream");
+        assertEquals(1, provider.opens(), "a failed turn must not open a follow-up stream");
     }
 
     @Test
@@ -571,8 +583,133 @@ final class RunEngineTraceTest {
 
         rig.sink.assertInvariants();
         assertEquals(0, write.calls(), "falling back to initialArguments after a stall would write the stale path");
-        assertEquals(ToolMessages.ARGS_CUT_OFF_BY_STALL, rig.sink.toolResult("call-1").orElseThrow().text());
         assertTrue(rig.sink.toolResult("call-1").orElseThrow().isError());
+    }
+
+    @Test
+    void contextPolicyFailureRetainsInjectedMessagesWithoutOpeningProvider() {
+        var provider = ScriptedProvider.simpleText();
+        var rig = new Rig().provider(provider).hooks(new AgentHooks() {
+            @Override public List<AgentMessage> beforeTurn(TurnContext ctx) {
+                return List.of(UserMessage.text("Durable injection", ctx.clock().instant()));
+            }
+            @Override public List<AgentMessage> transformContext(List<AgentMessage> messages, Cancellation cancel) {
+                throw new IllegalStateException("context policy unavailable");
+            }
+        });
+        RunResult result = rig.run("hi");
+        rig.sink.assertInvariants();
+        assertInstanceOf(RunOutcome.Failed.class, result.outcome());
+        assertEquals(0, provider.opens());
+        assertEquals(List.of("user", "user"), kinds(result.produced()));
+        assertEquals(result.produced(), rig.sink.ofType(AgentEvent.RunEnd.class).getFirst().produced());
+        assertEquals(result.produced(), result.state().transcript());
+    }
+
+    @Test
+    void requestPolicyAndConversionFailuresNeverSendFallbackData() {
+        var provider = ScriptedProvider.simpleText();
+        var requestRig = new Rig().provider(provider).hooks(new AgentHooks() {
+            @Override public LlmRequest beforeRequest(LlmRequest request, TurnContext ctx) {
+                throw new IllegalStateException("request policy unavailable");
+            }
+        });
+        assertInstanceOf(RunOutcome.Failed.class, requestRig.run("hi").outcome());
+        requestRig.sink.assertInvariants();
+        var converterRig = new Rig().provider(provider);
+        converterRig.converter = _ -> { throw new IllegalStateException("conversion unavailable"); };
+        assertInstanceOf(RunOutcome.Failed.class, converterRig.run("hi").outcome());
+        converterRig.sink.assertInvariants();
+        assertEquals(0, provider.opens());
+    }
+
+    @Test
+    void assistantPolicyFailurePadsCurrentCallsAndProducesOneConsistentEnd() {
+        var rig = new Rig().provider(ScriptedProvider.defaultScenario()).hooks(new AgentHooks() {
+            @Override public TurnVerdict afterAssistant(AssistantMessage message, TurnContext ctx) {
+                throw new IllegalStateException("assistant policy unavailable");
+            }
+        });
+        RunResult result = rig.run("hi");
+        rig.sink.assertInvariants();
+        assertInstanceOf(RunOutcome.Failed.class, result.outcome());
+        assertEquals(List.of("user", "assistant", "toolResult", "toolResult"), kinds(result.produced()));
+        assertEquals(result.produced(), rig.sink.ofType(AgentEvent.RunEnd.class).getFirst().produced());
+        assertEquals(1, rig.sink.ofType(AgentEvent.RunEnd.class).size());
+    }
+
+    @Test
+    void requestToolFilteringRemovesExecutionAuthority() {
+        var read = FakeTool.readOnly("read", "secret");
+        var rig = new Rig().provider(ScriptedProvider.thinkingTextTool()).tools(read).hooks(new AgentHooks() {
+            @Override public LlmRequest beforeRequest(LlmRequest request, TurnContext ctx) {
+                return request.withTools(List.of());
+            }
+        });
+        rig.run("hi");
+        rig.sink.assertInvariants();
+        assertEquals(0, read.calls());
+        assertTrue(rig.sink.toolResult("call-1").orElseThrow().isError());
+    }
+
+    @Test
+    void retryBudgetIsEnforcedWithoutTurnGuard() {
+        var provider = ScriptedProvider.simpleText();
+        var rig = new Rig().provider(provider).limits(RunLimits.DEFAULTS.withMaxTurns(2)).hooks(new AgentHooks() {
+            @Override public TurnVerdict afterAssistant(AssistantMessage message, TurnContext ctx) {
+                return new TurnVerdict.Retry(UserMessage.text("Again", ctx.clock().instant()), "host retry");
+            }
+        });
+        var outcome = assertInstanceOf(RunOutcome.LimitExceeded.class, rig.run("hi").outcome());
+        rig.sink.assertInvariants();
+        assertEquals(RunOutcome.Limit.MAX_TURNS, outcome.limit());
+        assertEquals(2, provider.opens());
+    }
+
+    @Test
+    void finalResponseAtTurnLimitCompletesButFollowUpCannotExceedIt() {
+        var provider = ScriptedProvider.simpleText();
+        var rig = new Rig().provider(provider).limits(RunLimits.DEFAULTS.withMaxTurns(1));
+        assertInstanceOf(RunOutcome.Completed.class, rig.run("hi").outcome());
+        var follow = new Rig().provider(provider).limits(RunLimits.DEFAULTS.withMaxTurns(1));
+        follow.followUps.push(UserMessage.text("Again", follow.clock.instant()));
+        assertEquals(RunOutcome.Limit.MAX_TURNS,
+                assertInstanceOf(RunOutcome.LimitExceeded.class, follow.run("hi").outcome()).limit());
+        rig.sink.assertInvariants();
+        follow.sink.assertInvariants();
+        assertEquals(2, provider.opens());
+    }
+
+    @Test
+    void toolCallBudgetComparisonCannotOverflow() {
+        var read = FakeTool.readOnly("read", "contents");
+        var bash = FakeTool.readOnly("bash", "output");
+        var rig = new Rig().provider(ScriptedProvider.defaultScenario()).tools(read, bash);
+        var state = rig.driver("hi").until(Phase.TOOLS_RUNNING).state();
+        var nearCap = new sdk.agent.RunState(state.runId(), state.phase(), state.turnIndex(), state.transcript(),
+                state.seedSize(), state.pendingInjection(), state.turn(), state.limits(), state.turnsUsed(),
+                Integer.MAX_VALUE - 1, state.usage(), state.startedAt(), state.outcome(), state.toolSetHash());
+        var result = rig.engine().run(nearCap, rig.deps());
+        rig.sink.assertInvariants();
+        assertEquals(RunOutcome.Limit.MAX_TOOL_CALLS,
+                assertInstanceOf(RunOutcome.LimitExceeded.class, result.outcome()).limit());
+        assertEquals(0, read.calls() + bash.calls());
+    }
+
+    @Test
+    void unsuccessfulProviderTurnsNeverExecuteCollectedCalls() {
+        for (StopReason reason : List.of(StopReason.ERROR, StopReason.ABORTED, StopReason.LENGTH)) {
+            var script = new ArrayList<>(ScriptedProvider.toolCall(0, "call-1", "write", "{\"path\":\"secret.txt\"}"));
+            script.add(ScriptedProvider.emit(new sdk.agent.provider.LlmStreamEvent.Done(
+                    reason, sdk.agent.message.Usage.EMPTY, "response", sdk.agent.json.Json.nil())));
+            var write = FakeTool.mutating("write", "written");
+            var rig = new Rig().provider(ScriptedProvider.of(script)).tools(write);
+            rig.run("hi");
+            rig.sink.assertInvariants();
+            assertEquals(0, write.calls(), reason.name());
+            assertTrue(rig.sink.toolResult("call-1").orElseThrow().isError(), reason.name());
+            assertTrue(rig.sink.ofType(AgentEvent.ToolStart.class).isEmpty(), reason.name());
+        }
     }
 
     // ---- helpers -------------------------------------------------------------------------------

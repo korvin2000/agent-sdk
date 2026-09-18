@@ -23,11 +23,11 @@
 hs_err_pid*
 replay_pid*
 
-tools/
+/tools/
 agent-sdk/buildSrc/.gradle/
 build/
 .gradle/
-!gradle/wrapper/gradle-wrapper.jar
+!agent-sdk/gradle/wrapper/gradle-wrapper.jar
 
 
 

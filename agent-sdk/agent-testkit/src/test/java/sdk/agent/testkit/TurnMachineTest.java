@@ -88,7 +88,7 @@ final class TurnMachineTest {
         assertInstanceOf(StepOutcome.Ignored.class, machine.step(streaming, new StepInput.Begin(REQUEST), NOW));
         assertInstanceOf(StepOutcome.Ignored.class, machine.step(streaming, new StepInput.Verdict(TurnVerdict.PROCEED), NOW));
 
-        TurnState ready = drive(streaming, chunk(new LlmStreamEvent.Done(StopReason.STOP, Usage.EMPTY, "r")));
+        TurnState ready = drive(streaming, chunk(new LlmStreamEvent.Done(StopReason.STOP, Usage.EMPTY, "r", sdk.agent.json.Json.nil())));
         assertEquals(TurnPhase.ASSISTANT_READY, ready.phase());
         assertInstanceOf(StepOutcome.Ignored.class, machine.step(ready, chunk(new LlmStreamEvent.Start()), NOW));
         assertInstanceOf(StepOutcome.Ignored.class, machine.step(ready, new StepInput.StreamOpened(), NOW));
@@ -103,7 +103,7 @@ final class TurnMachineTest {
     // ---- the stale-snapshot rule (Appendix B, 10 / 11 / 12) ------------------------------------
 
     @Test
-    @DisplayName("12: a stalled stream suppresses the initialArguments fallback (ARGS_CUT_OFF_BY_STALL)")
+    @DisplayName("a stalled stream suppresses the initialArguments fallback")
     void scenario12StaleSnapshotIsSuppressedWhenStalled() {
         TurnState state = drive(opening(),
                 new StepInput.Begin(REQUEST),
@@ -118,37 +118,34 @@ final class TurnMachineTest {
         assertAll(
                 () -> assertSame(Json.Null.NULL, call.arguments(),
                         "the truncated call must carry Json.Null, never the stale snapshot"),
-                () -> assertEquals(ToolMessages.ARGS_CUT_OFF_BY_STALL, state.preflight().get("call-1")),
-                () -> assertEquals(StopReason.TOOL_USE, state.assistant().stopReason()));
+                () -> assertEquals(StopReason.ERROR, state.assistant().stopReason()));
     }
 
     @Test
-    @DisplayName("11: unparseable, not stalled, no snapshot → ARGS_INVALID_JSON")
+    @DisplayName("unparseable arguments without a snapshot become null")
     void scenario11UnparseableWithoutSnapshot() {
         TurnState state = drive(opening(),
                 new StepInput.Begin(REQUEST),
                 new StepInput.StreamOpened(),
                 chunk(new LlmStreamEvent.ToolCallStart(0, "call-1", "write", Json.Obj.EMPTY)),
                 chunk(new LlmStreamEvent.ToolCallDelta(0, "{\"path\": \"/tmp/test.txt\", \"content\": \"incomplete", false)),
-                chunk(new LlmStreamEvent.Done(StopReason.TOOL_USE, Usage.EMPTY, "r")));
+                chunk(new LlmStreamEvent.Done(StopReason.TOOL_USE, Usage.EMPTY, "r", sdk.agent.json.Json.nil())));
 
         assertTrue(!state.stalled(), "a clean Done does not stall the turn");
         assertSame(Json.Null.NULL, state.assistant().toolCalls().getFirst().arguments());
-        assertEquals(ToolMessages.ARGS_INVALID_JSON, state.preflight().get("call-1"));
     }
 
     @Test
-    @DisplayName("11b: unparseable, not stalled, WITH a snapshot → the snapshot is used")
+    @DisplayName("unparseable arguments never fall back to a start snapshot")
     void scenario11UnparseableWithSnapshotFallsBack() {
         TurnState state = drive(opening(),
                 new StepInput.Begin(REQUEST),
                 new StepInput.StreamOpened(),
                 chunk(new LlmStreamEvent.ToolCallStart(0, "call-1", "write", Json.obj("path", Json.str("/tmp/snap.txt")))),
                 chunk(new LlmStreamEvent.ToolCallDelta(0, "{\"path\": \"/tmp/tru", false)),
-                chunk(new LlmStreamEvent.Done(StopReason.TOOL_USE, Usage.EMPTY, "r")));
+                chunk(new LlmStreamEvent.Done(StopReason.TOOL_USE, Usage.EMPTY, "r", sdk.agent.json.Json.nil())));
 
-        assertEquals(Json.obj("path", Json.str("/tmp/snap.txt")), state.assistant().toolCalls().getFirst().arguments());
-        assertTrue(state.preflight().isEmpty(), "a usable fallback records no preflight problem");
+        assertSame(Json.Null.NULL, state.assistant().toolCalls().getFirst().arguments());
     }
 
     @Test
@@ -163,7 +160,6 @@ final class TurnMachineTest {
 
         assertTrue(state.stalled());
         assertEquals(Json.obj("path", Json.str("file.txt")), state.assistant().toolCalls().getFirst().arguments());
-        assertTrue(state.preflight().isEmpty(), "valid JSON is usable even after a stall");
     }
 
     @Test
@@ -182,8 +178,8 @@ final class TurnMachineTest {
     // ---- block finalisation (Appendix B, 14 / 15 / 18) -----------------------------------------
 
     @Test
-    @DisplayName("14/15: whitespace-only text never opens a TEXT block")
-    void whitespaceOnlyTextNeverOpensABlock() {
+    @DisplayName("text whitespace and empty signed/redacted thinking blocks are preserved")
+    void whitespaceAndSignedEmptyBlocksArePreserved() {
         TurnState thenThink = drive(opening(),
                 new StepInput.Begin(REQUEST), new StepInput.StreamOpened(),
                 chunk(new LlmStreamEvent.TextStart(0)),
@@ -195,12 +191,13 @@ final class TurnMachineTest {
                 chunk(new LlmStreamEvent.TextStart(2)),
                 chunk(new LlmStreamEvent.TextDelta(2, "Hello, world!")),
                 chunk(new LlmStreamEvent.TextEnd(2, "Hello, world!", null)),
-                chunk(new LlmStreamEvent.Done(StopReason.STOP, Usage.EMPTY, "r")));
+                chunk(new LlmStreamEvent.Done(StopReason.STOP, Usage.EMPTY, "r", sdk.agent.json.Json.nil())));
 
-        assertEquals(List.of(new ContentBlock.Thinking("Right.", "sig", false),
+        assertEquals(List.of(new ContentBlock.Text("\n\n", null),
+                             new ContentBlock.Thinking("Right.", "sig", false),
                              new ContentBlock.Text("Hello, world!", null)),
                 thenThink.assistant().content(),
-                "the blank block must be dropped and the order must be THINK then TEXT");
+                "completed blocks retain source content, including whitespace");
 
         events.clear();
         TurnState thenText = drive(opening(),
@@ -211,9 +208,108 @@ final class TurnMachineTest {
                 chunk(new LlmStreamEvent.TextStart(1)),
                 chunk(new LlmStreamEvent.TextDelta(1, "Hello, world!")),
                 chunk(new LlmStreamEvent.TextEnd(1, "Hello, world!", null)),
-                chunk(new LlmStreamEvent.Done(StopReason.STOP, Usage.EMPTY, "r")));
+                chunk(new LlmStreamEvent.Done(StopReason.STOP, Usage.EMPTY, "r", sdk.agent.json.Json.nil())));
 
-        assertEquals(List.of(new ContentBlock.Text("Hello, world!", null)), thenText.assistant().content());
+        assertEquals(List.of(new ContentBlock.Text("   \t\n ", null), new ContentBlock.Text("Hello, world!", null)),
+                thenText.assistant().content());
+    }
+
+    @Test
+    void interleavedIndicesFinishInSourceOrder() {
+        TurnState state = drive(opening(),
+                new StepInput.Begin(REQUEST), new StepInput.StreamOpened(),
+                chunk(new LlmStreamEvent.TextStart(0)),
+                chunk(new LlmStreamEvent.ThinkingStart(1)),
+                chunk(new LlmStreamEvent.ToolCallStart(2, "call-2", "read", Json.Obj.EMPTY)),
+                chunk(new LlmStreamEvent.ToolCallStart(3, "call-3", "read", Json.Obj.EMPTY)),
+                chunk(new LlmStreamEvent.ThinkingDelta(1, "thought")),
+                chunk(new LlmStreamEvent.TextDelta(0, "text")),
+                chunk(new LlmStreamEvent.ToolCallDelta(2, "{\"path\":\"a\"}", false)),
+                chunk(new LlmStreamEvent.ToolCallDelta(3, "{\"path\":\"b\"}", false)),
+                chunk(new LlmStreamEvent.ToolCallEnd(3, new ContentBlock.ToolCall("call-3", "read", Json.obj("path", Json.str("b")), null))),
+                chunk(new LlmStreamEvent.TextEnd(0, "text", null)),
+                chunk(new LlmStreamEvent.ToolCallEnd(2, new ContentBlock.ToolCall("call-2", "read", Json.obj("path", Json.str("a")), null))),
+                chunk(new LlmStreamEvent.ThinkingEnd(1, "thought", null, false)),
+                chunk(new LlmStreamEvent.Done(StopReason.TOOL_USE, Usage.EMPTY, "r", Json.nil())));
+
+        assertEquals(List.of(new ContentBlock.Text("text", null),
+                             new ContentBlock.Thinking("thought", null, false),
+                             new ContentBlock.ToolCall("call-2", "read", Json.obj("path", Json.str("a")), null),
+                             new ContentBlock.ToolCall("call-3", "read", Json.obj("path", Json.str("b")), null)),
+                state.assistant().content());
+        assertTrue(state.content().isEmpty() && state.openBlocks().isEmpty() && state.activeCalls().isEmpty(),
+                "final assistant owns all content and transient maps are cleared");
+    }
+
+    @Test
+    void malformedProtocolTerminatesWithoutExecutingOffendingBlock() {
+        TurnState state = drive(opening(),
+                new StepInput.Begin(REQUEST), new StepInput.StreamOpened(),
+                chunk(new LlmStreamEvent.TextStart(0)),
+                chunk(new LlmStreamEvent.TextDelta(0, "accepted")),
+                chunk(new LlmStreamEvent.TextStart(0)));
+
+        assertEquals(TurnPhase.ASSISTANT_READY, state.phase());
+        assertEquals(StopReason.ERROR, state.assistant().stopReason());
+        assertEquals(List.of(new ContentBlock.Text("accepted", null)), state.assistant().content());
+        assertTrue(state.assistant().toolCalls().isEmpty(), "invalid block must not invent a tool call");
+
+        StepOutcome closed = machine.step(state, new StepInput.Verdict(TurnVerdict.PROCEED), NOW);
+        assertInstanceOf(StepOutcome.Finished.class, closed);
+        assertTrue(closed.events().stream().noneMatch(AgentEvent.ToolStart.class::isInstance),
+                "protocol-error assistants never request or start tools");
+    }
+
+    @Test
+    void emptySignedAndRedactedThinkingBlocksSurvive() {
+        TurnState state = drive(opening(),
+                new StepInput.Begin(REQUEST), new StepInput.StreamOpened(),
+                chunk(new LlmStreamEvent.ThinkingStart(0)),
+                chunk(new LlmStreamEvent.ThinkingEnd(0, "", "sig", false)),
+                chunk(new LlmStreamEvent.ThinkingStart(1)),
+                chunk(new LlmStreamEvent.ThinkingEnd(1, "", null, true)),
+                chunk(new LlmStreamEvent.Done(StopReason.STOP, Usage.EMPTY, "r", Json.nil())));
+
+        assertEquals(List.of(new ContentBlock.Thinking("", "sig", false),
+                             new ContentBlock.Thinking("", null, true)), state.assistant().content());
+    }
+
+    @Test
+    void emptyArgumentFragmentSuppressesInitialObject() {
+        TurnState state = drive(opening(),
+                new StepInput.Begin(REQUEST), new StepInput.StreamOpened(),
+                chunk(new LlmStreamEvent.ToolCallStart(0, "call-1", "write",
+                        Json.obj("path", Json.str("stale")))),
+                chunk(new LlmStreamEvent.ToolCallDelta(0, "", false)),
+                chunk(new LlmStreamEvent.Done(StopReason.TOOL_USE, Usage.EMPTY, "r", Json.nil())));
+
+        assertSame(Json.Null.NULL, state.assistant().toolCalls().getFirst().arguments());
+    }
+
+    @Test
+    void invalidToolIdentitiesTerminateBeforeCallsBecomeExecutable() {
+        TurnState blank = drive(opening(),
+                new StepInput.Begin(REQUEST), new StepInput.StreamOpened(),
+                chunk(new LlmStreamEvent.ToolCallStart(0, " ", "read", Json.Obj.EMPTY)));
+        assertEquals(StopReason.ERROR, blank.assistant().stopReason());
+        assertTrue(blank.assistant().toolCalls().isEmpty());
+
+        TurnState duplicate = drive(opening(),
+                new StepInput.Begin(REQUEST), new StepInput.StreamOpened(),
+                chunk(new LlmStreamEvent.ToolCallStart(0, "same", "read", Json.Obj.EMPTY)),
+                chunk(new LlmStreamEvent.ToolCallStart(1, "same", "read", Json.Obj.EMPTY)));
+        assertEquals(StopReason.ERROR, duplicate.assistant().stopReason());
+        assertEquals("same", duplicate.assistant().toolCalls().getFirst().id(),
+                "the first accepted call remains; the duplicate block is rejected");
+
+        TurnState mismatch = drive(opening(),
+                new StepInput.Begin(REQUEST), new StepInput.StreamOpened(),
+                chunk(new LlmStreamEvent.ToolCallStart(0, "call", "read", Json.Obj.EMPTY)),
+                chunk(new LlmStreamEvent.ToolCallEnd(0,
+                        new ContentBlock.ToolCall("other", "read", Json.Obj.EMPTY, null))));
+        assertEquals(StopReason.ERROR, mismatch.assistant().stopReason());
+        assertEquals("call", mismatch.assistant().toolCalls().getFirst().id(),
+                "the accepted start is retained; mismatched end does not invent its identity");
     }
 
     @Test
@@ -227,11 +323,20 @@ final class TurnMachineTest {
                 chunk(new LlmStreamEvent.TextDelta(1, "writing it now")),
                 chunk(new LlmStreamEvent.TextEnd(1, "writing it now", null)),
                 chunk(new LlmStreamEvent.ToolCallDelta(0, "\"content\":\"hi\"}", false)),
-                chunk(new LlmStreamEvent.Done(StopReason.TOOL_USE, Usage.EMPTY, "r")));
+                chunk(new LlmStreamEvent.Done(StopReason.TOOL_USE, Usage.EMPTY, "r", sdk.agent.json.Json.nil())));
 
         assertEquals(Json.obj("path", Json.str("/tmp/x.txt"), "content", Json.str("hi")),
                 state.assistant().toolCalls().getFirst().arguments());
-        assertTrue(state.preflight().isEmpty());
+    }
+
+    @Test
+    void doneReplayEnvelopeReachesAssistantUnchanged() {
+        Json replay = Json.obj("itemId", Json.str("item-7"), "encrypted", Json.str("cipher"));
+        TurnState state = drive(opening(),
+                new StepInput.Begin(REQUEST), new StepInput.StreamOpened(),
+                chunk(new LlmStreamEvent.Done(StopReason.STOP, Usage.EMPTY, "r", replay)));
+
+        assertEquals(replay, state.assistant().providerData());
     }
 
     @Test
@@ -244,7 +349,7 @@ final class TurnMachineTest {
                 chunk(new LlmStreamEvent.TextDelta(0, "Hello, ")),
                 chunk(new LlmStreamEvent.TextDelta(0, "world!")),
                 chunk(new LlmStreamEvent.TextEnd(0, "Hello, world!", null)),
-                chunk(new LlmStreamEvent.Done(StopReason.STOP, Usage.tokens(10, 5), "resp-1")));
+                chunk(new LlmStreamEvent.Done(StopReason.STOP, Usage.tokens(10, 5), "resp-1", sdk.agent.json.Json.nil())));
 
         assertEquals(List.of("TurnStart", "MessageStart", "MessageUpdate", "MessageUpdate", "MessageUpdate",
                              "MessageUpdate", "MessageEnd"), trace(events),
@@ -316,7 +421,7 @@ final class TurnMachineTest {
     }
 
     @Test
-    @DisplayName("a Stop or Retry verdict closes the turn with no tool results, however many calls it carried")
+    @DisplayName("Stop and Retry verdicts pad every call before TurnEnd")
     void verdictShortCircuitsTools() {
         TurnState ready = twoCallTurnReady();
         events.clear();
@@ -324,9 +429,19 @@ final class TurnMachineTest {
         StepOutcome stop = machine.step(ready, new StepInput.Verdict(
                 new TurnVerdict.Stop(new sdk.agent.event.RunOutcome.Aborted(), null)), NOW);
         assertInstanceOf(StepOutcome.Finished.class, stop);
+        assertEquals(List.of("MessageStart", "MessageEnd", "MessageStart", "MessageEnd", "TurnEnd"),
+                trace(stop.events()));
         var turnEnd = (AgentEvent.TurnEnd) stop.events().getLast();
-        assertTrue(turnEnd.toolResults().isEmpty(), "a refused turn runs nothing, so it reports nothing");
-        assertEquals(2, turnEnd.message().toolCalls().size());
+        assertEquals(List.of("call-1", "call-2"), turnEnd.toolResults().stream().map(ToolResultMessage::toolCallId).toList());
+        assertTrue(turnEnd.toolResults().stream().allMatch(r -> r.text().equals(ToolMessages.NOT_EXECUTED)));
+    }
+    @Test
+    void retryAlsoPadsBeforeClosing() {
+        StepOutcome out = machine.step(twoCallTurnReady(), new StepInput.Verdict(
+                new TurnVerdict.Retry(sdk.agent.message.UserMessage.text("retry", NOW), "invalid")), NOW);
+        assertEquals(List.of("MessageStart", "MessageEnd", "MessageStart", "MessageEnd", "TurnEnd"),
+                trace(out.events()));
+        assertEquals(2, ((AgentEvent.TurnEnd) out.events().getLast()).toolResults().size());
     }
 
     @Test
@@ -337,7 +452,7 @@ final class TurnMachineTest {
                 chunk(new LlmStreamEvent.TextStart(0)),
                 chunk(new LlmStreamEvent.TextDelta(0, "done")),
                 chunk(new LlmStreamEvent.TextEnd(0, "done", null)),
-                chunk(new LlmStreamEvent.Done(StopReason.STOP, Usage.EMPTY, "r")));
+                chunk(new LlmStreamEvent.Done(StopReason.STOP, Usage.EMPTY, "r", sdk.agent.json.Json.nil())));
         events.clear();
 
         StepOutcome out = machine.step(ready, new StepInput.Verdict(TurnVerdict.PROCEED), NOW);
@@ -352,10 +467,8 @@ final class TurnMachineTest {
         TurnState streaming = drive(opening(), new StepInput.Begin(REQUEST), new StepInput.StreamOpened(),
                 chunk(new LlmStreamEvent.TextStart(0)),
                 chunk(new LlmStreamEvent.TextDelta(0, "partial")));
-        events.clear();
-
         StepOutcome out = machine.step(streaming, new StepInput.Cancel(), NOW);
-        assertEquals(List.of("MessageEnd"), trace(out.events()));
+        assertEquals(List.of("MessageEnd", "TurnEnd"), trace(out.events()));
         assertEquals(StopReason.ABORTED, out.state().assistant().stopReason());
         assertEquals("The run was aborted.", out.state().assistant().errorMessage());
         assertEquals("partial", out.state().assistant().text(), "the partial text is kept, once, at MessageEnd");
@@ -366,14 +479,14 @@ final class TurnMachineTest {
     @DisplayName("Cancel before the stream opens still brackets the turn: TurnStart, MessageStart, MessageEnd")
     void cancelBeforeTheStreamOpensStillBracketsTheTurn() {
         StepOutcome fromOpening = machine.step(opening(), new StepInput.Cancel(), NOW);
-        assertEquals(List.of("TurnStart", "MessageStart", "MessageEnd"), trace(fromOpening.events()),
+        assertEquals(List.of("TurnStart", "MessageStart", "MessageEnd", "TurnEnd"), trace(fromOpening.events()),
                 "I3 and I8 must hold on the abort path too, even when nothing was ever emitted");
         assertEquals(StopReason.ABORTED, fromOpening.state().assistant().stopReason());
 
         TurnState requested = drive(opening(), new StepInput.Begin(REQUEST));
         events.clear();
         StepOutcome fromRequested = machine.step(requested, new StepInput.Cancel(), NOW);
-        assertEquals(List.of("MessageStart", "MessageEnd"), trace(fromRequested.events()),
+        assertEquals(List.of("MessageStart", "MessageEnd", "TurnEnd"), trace(fromRequested.events()),
                 "TurnStart was already emitted by Begin; the message pair is still owed");
     }
 
@@ -386,7 +499,7 @@ final class TurnMachineTest {
                 chunk(new LlmStreamEvent.ToolCallDelta(0, "{\"path\":\"a.txt\"}", false)),
                 chunk(new LlmStreamEvent.ToolCallStart(1, "call-2", "read", Json.Obj.EMPTY)),
                 chunk(new LlmStreamEvent.ToolCallDelta(1, "{\"path\":\"b.txt\"}", false)),
-                chunk(new LlmStreamEvent.Done(StopReason.TOOL_USE, Usage.EMPTY, "r")));
+                chunk(new LlmStreamEvent.Done(StopReason.TOOL_USE, Usage.EMPTY, "r", sdk.agent.json.Json.nil())));
     }
 
     private TurnState twoCallTurnInToolsRunning() {

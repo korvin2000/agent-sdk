@@ -12,6 +12,7 @@ import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
@@ -21,14 +22,21 @@ import org.junit.jupiter.api.Timeout;
 import sdk.agent.Agent;
 import sdk.agent.AgentRun;
 import sdk.agent.AgentSnapshot;
+import sdk.agent.Phase;
+import sdk.agent.RunStateCodec;
 import sdk.agent.RunLimits;
 import sdk.agent.RunResult;
 import sdk.agent.event.AgentEvent;
 import sdk.agent.event.RunOutcome;
+import sdk.agent.hook.AgentHooks;
+import sdk.agent.hook.TurnContext;
+import sdk.agent.json.Json;
+import sdk.agent.message.ToolResultMessage;
 import sdk.agent.message.StopReason;
 import sdk.agent.message.Usage;
 import sdk.agent.message.UserMessage;
 import sdk.agent.provider.LlmProvider;
+import sdk.agent.provider.LlmRequest;
 import sdk.agent.provider.LlmStreamEvent;
 import sdk.agent.spi.Contributions;
 import sdk.agent.spi.Extension;
@@ -75,7 +83,7 @@ final class AgentFacadeTest {
         steps.add(ScriptedProvider.emit(new LlmStreamEvent.TextStart(0)));
         for (int i = 0; i < n; i++) steps.add(ScriptedProvider.emit(new LlmStreamEvent.TextDelta(0, "x")));
         steps.add(ScriptedProvider.emit(new LlmStreamEvent.TextEnd(0, "x".repeat(n), null)));
-        steps.add(ScriptedProvider.emit(new LlmStreamEvent.Done(StopReason.STOP, Usage.tokens(1, n), "resp-long")));
+        steps.add(ScriptedProvider.emit(new LlmStreamEvent.Done(StopReason.STOP, Usage.tokens(1, n), "resp-long", sdk.agent.json.Json.nil())));
         return ScriptedProvider.of(steps);
     }
 
@@ -164,6 +172,67 @@ final class AgentFacadeTest {
         assertFalse(agent.state().running());
     }
 
+    @Test
+    @DisplayName("close is idempotent and rejects new runs and controls")
+    void closeIsIdempotentAndRejectsOperations() throws Exception {
+        var closed = new AtomicInteger();
+        Extension extension = new Extension() {
+            @Override public String id() { return "close-count"; }
+            @Override public Contributions contributions() { return Contributions.builder().build(); }
+            @Override public void close() { closed.incrementAndGet(); }
+        };
+        Agent agent = Agent.builder()
+                .provider(ScriptedProvider.simpleText())
+                .turnGuard(null)
+                .extension(extension)
+                .build();
+        open.add(agent);
+
+        AgentRun run = agent.prompt("hi");
+        run.result().get(10, TimeUnit.SECONDS);
+        var checkpoint = run.state();
+        agent.close();
+        agent.close();
+
+        assertEquals(1, closed.get());
+        assertFalse(agent.state().running());
+        assertThrows(IllegalStateException.class, () -> agent.prompt("after close"));
+        assertThrows(IllegalStateException.class, agent::resume);
+        assertThrows(IllegalStateException.class, () -> agent.resume(checkpoint));
+        assertThrows(IllegalStateException.class, agent::reset);
+        assertThrows(IllegalStateException.class, agent::abort);
+        assertThrows(IllegalStateException.class, () -> agent.steer(UserMessage.text("late")));
+        assertThrows(IllegalStateException.class, () -> agent.followUp(UserMessage.text("late")));
+    }
+
+    @Test
+    void resumingASettledBatchPreservesOriginalPendingAuthority() throws Exception {
+        var read = FakeTool.mutating("read", "read result");
+        var bash = FakeTool.mutating("bash", "must not run");
+        var rig = new Rig().provider(ScriptedProvider.defaultScenario()).tools(read, bash).sequential()
+                .hooks(new AgentHooks() {
+                    @Override public LlmRequest beforeRequest(LlmRequest request, TurnContext context) {
+                        return request.withTools(request.tools().stream().filter(t -> t.name().equals("read")).toList());
+                    }
+                });
+        var driver = rig.driver("checkpoint").until(Phase.TOOLS_RUNNING).one();
+        var codec = RunStateCodec.builtIn();
+        var checkpoint = codec.decode(Json.parse(codec.encode(driver.state()).toText()));
+        var changedRegistry = build((request, cancel) -> { throw new AssertionError("provider must not open"); });
+        assertThrows(IllegalStateException.class, () -> changedRegistry.resume(checkpoint));
+
+        var agent = build(ScriptedProvider.simpleText(), read, bash);
+        var result = agent.resume(checkpoint).result().get(10, TimeUnit.SECONDS);
+        assertTrue(result.isSuccess());
+        assertEquals(1, read.calls(), "the durably settled call is not replayed");
+        assertEquals(0, bash.calls(), "the original request excluded the pending tool");
+        var results = result.state().transcript().stream().filter(ToolResultMessage.class::isInstance)
+                .map(ToolResultMessage.class::cast).toList();
+        assertEquals(2, results.size());
+        assertTrue(results.getLast().isError());
+        assertEquals(checkpoint.turn().pendingCalls().getFirst().id(), results.getLast().toolCallId());
+    }
+
     // ---- observation ---------------------------------------------------------------------------
 
     @Test
@@ -204,6 +273,7 @@ final class AgentFacadeTest {
 
     @Test
     @DisplayName("AgentSnapshot counts turns, tool calls and transcript entries")
+
     void snapshotCounts() throws Exception {
         Agent agent = build(ScriptedProvider.defaultScenario(),
                 FakeTool.readOnly("read", "contents"), FakeTool.readOnly("bash", "total 0"));
@@ -220,6 +290,17 @@ final class AgentFacadeTest {
         assertEquals(5, snapshot.transcriptSize(), "prompt, assistant, two results, closing assistant");
         assertEquals(1, snapshot.turnIndex());
         assertEquals(0, snapshot.pendingSteering());
+    }
+    @Test
+    @DisplayName("closing a partially consumed event stream abandons observation without stranding the run")
+    void closingPartialEventStreamDoesNotStrandRun() throws Exception {
+        Agent agent = build(hanging());
+        AgentRun run = agent.prompt("hi");
+        try (var events = run.events()) {
+            assertInstanceOf(AgentEvent.RunStart.class, events.iterator().next());
+        }
+        agent.abort();
+        assertEquals(new RunOutcome.Aborted(), run.result().get(10, TimeUnit.SECONDS).outcome());
     }
 
     @Test

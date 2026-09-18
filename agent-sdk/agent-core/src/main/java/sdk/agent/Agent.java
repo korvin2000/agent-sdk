@@ -11,7 +11,6 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
-
 import sdk.agent.concurrent.Cancellation;
 import sdk.agent.event.AgentListener;
 import sdk.agent.event.EventSink;
@@ -69,6 +68,8 @@ public final class Agent implements AutoCloseable {
     private AgentRun active;                                // guarded by lock
     private AgentRun last;                                  // guarded by lock
     private CompletableFuture<Void> idle = CompletableFuture.completedFuture(null);   // guarded by lock
+    private boolean closed;                                 // guarded by lock
+    private Thread driver;                                  // guarded by lock
 
     Agent(Config cfg, ListenerFanout fanout) {
         this.cfg = Objects.requireNonNull(cfg);
@@ -90,11 +91,10 @@ public final class Agent implements AutoCloseable {
 
     /// Another turn from the current transcript; steering messages, if any, are used.
     public AgentRun resume() { return start(List.of()); }
-
-    /// Resume a checkpointed run (`AgentRun.state()`, persisted through [#codec]) with this agent's
-    /// collaborators. Refused, naming the reason, if the run is finished or the tool set changed.
     public AgentRun resume(RunState persisted) {
         Objects.requireNonNull(persisted, "persisted");
+        synchronized (lock) { ensureOpen(); }
+        RunStateCodec.validateDurable(persisted);
         if (persisted.finished()) throw new IllegalStateException("run " + persisted.runId() + " is already finished");
         ToolRegistry tools = tools();
         if (persisted.toolSetHash() != null && !persisted.toolSetHash().equals(tools.hash())) {
@@ -109,6 +109,7 @@ public final class Agent implements AutoCloseable {
 
     private AgentRun start(List<AgentMessage> prompts) {
         synchronized (lock) {
+            ensureOpen();
             ToolRegistry tools = tools();
             String runId = UUID.randomUUID().toString();
             return launch(RunEngine.start(prompts, transcript, cfg.limits(), tools.hash(), runId, cfg.clock().instant()), tools);
@@ -117,6 +118,7 @@ public final class Agent implements AutoCloseable {
 
     private AgentRun launch(RunState initial, ToolRegistry tools) {
         synchronized (lock) {
+            ensureOpen();
             if (active != null) throw new IllegalStateException("a run is already active: " + active.runId());
             var cancel = Cancellation.create();
             var queue = new QueueSink();
@@ -124,19 +126,45 @@ public final class Agent implements AutoCloseable {
             RunDeps deps = new RunDeps(cfg.provider(), tools, cfg.hooks(), cfg.converter(), sink, cancel,
                     steering::drain, followUps::drain, cfg.requestTemplate().withSystemPrompt(systemPrompt(tools)), cfg.clock());
             var run = new AgentRun(initial.runId(), cancel, queue, initial);
+            var previousIdle = idle;
             active = run;
             last = run;
             idle = new CompletableFuture<>();
-            runner.submit(() -> drive(run, initial, deps, sink));
-            return run;
+            try {
+                runner.submit(() -> {
+                    synchronized (lock) { driver = Thread.currentThread(); }
+                    try { drive(run, initial, deps, sink); }
+                    finally {
+                        synchronized (lock) {
+                            if (driver == Thread.currentThread()) driver = null;
+                        }
+                    }
+                });
+                return run;
+            } catch (RuntimeException failure) {
+                active = null;
+                idle = previousIdle;
+                var outcome = new RunOutcome.Failed(StopReason.ERROR, "run could not be submitted", failure);
+                var result = new RunResult(initial, outcome);
+                run.complete(result);
+                previousIdle.complete(null);
+                try {
+                    sink.emit(new sdk.agent.event.AgentEvent.RunEnd(initial.runId(), sdk.agent.event.AgentEvent.RUN_SCOPED,
+                            cfg.clock().instant(), initial.produced(), outcome));
+                } catch (Throwable t) {
+                    LOG.log(System.Logger.Level.WARNING, "failed to emit submission failure", t);
+                } finally {
+                    try { sink.close(); } catch (Throwable t) { LOG.log(System.Logger.Level.WARNING, "failed to close run events", t); }
+                }
+                return run;
+            }
         }
     }
-
     private void drive(AgentRun run, RunState initial, RunDeps deps, EventSink sink) {
-        var engine = new RunEngine(new TurnMachine(cfg.toolIdleTimeout()));
         RunState state = initial;
         RunResult result;
         try {
+            var engine = new RunEngine(new TurnMachine(cfg.toolIdleTimeout()));
             Step step = engine.advance(state, deps);
             while (true) {
                 state = step.state();
@@ -148,12 +176,18 @@ public final class Agent implements AutoCloseable {
             LOG.log(System.Logger.Level.ERROR, "run " + run.runId() + " failed", t);
             result = new RunResult(state, new RunOutcome.Failed(StopReason.ERROR, ToolFunnel.describe(t), t));
         } finally {
-            sink.close();                                                   // non-negotiable
+            try { sink.close(); } catch (Throwable t) {
+                LOG.log(System.Logger.Level.WARNING, "failed to close run events", t);
+            }
         }
+        finish(run, result);
+    }
+
+    private void finish(AgentRun run, RunResult result) {
         CompletableFuture<Void> wasIdle;
         synchronized (lock) {
             transcript = result.state().transcript();
-            active = null;
+            if (active == run) active = null;
             wasIdle = idle;
         }
         run.complete(result);
@@ -192,16 +226,29 @@ public final class Agent implements AutoCloseable {
 
     // ---- control -------------------------------------------------------------------------------
 
-    public void steer(AgentMessage message) { steering.push(message); }
+    public void steer(AgentMessage message) {
+        synchronized (lock) {
+            ensureOpen();
+            steering.push(message);
+        }
+    }
 
-    public void followUp(AgentMessage message) { followUps.push(message); }
+    public void followUp(AgentMessage message) {
+        synchronized (lock) {
+            ensureOpen();
+            followUps.push(message);
+        }
+    }
 
     /// Returns without waiting; [#waitForIdle] is how you learn it stopped. Also clears both queues.
     public void abort() {
         AgentRun run;
-        synchronized (lock) { run = active; }
-        steering.clear();
-        followUps.clear();
+        synchronized (lock) {
+            ensureOpen();
+            run = active;
+            steering.clear();
+            followUps.clear();
+        }
         if (run != null) run.abort();
     }
 
@@ -211,23 +258,50 @@ public final class Agent implements AutoCloseable {
 
     /// Aborts, waits, then clears the transcript and both queues.
     public void reset() {
+        synchronized (lock) { ensureOpen(); }
         abort();
-        waitForIdle().join();
-        synchronized (lock) { transcript = List.of(); last = null; }
+        try {
+            waitForIdle().join();
+        } finally {
+            synchronized (lock) {
+                ensureOpen();
+                transcript = List.of();
+                last = null;
+            }
+        }
     }
 
     /// Aborts any run, waits briefly, closes extensions in reverse order (a throw from one does not
     /// stop the others) and releases the run executor.
     @Override public void close() {
-        abort();
+        AgentRun run;
+        boolean calledByDriver;
+        synchronized (lock) {
+            if (closed) return;
+            closed = true;
+            run = active;
+            calledByDriver = driver == Thread.currentThread();
+            steering.clear();
+            followUps.clear();
+        }
+        if (run != null) run.abort();
         try {
-            waitForIdle().get(5, TimeUnit.SECONDS);
+            if (!calledByDriver) waitForIdle().get(5, TimeUnit.SECONDS);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
         } catch (Exception _) {
             // an unresponsive run is abandoned; its RunEnd still fires when it notices the cancel
+        } finally {
+            for (Extension e : cfg.extensions().reversed()) {
+                try { e.close(); } catch (Exception ex) {
+                    LOG.log(System.Logger.Level.WARNING, "extension " + e.id() + " close threw", ex);
+                }
+            }
+            runner.shutdownNow();
         }
-        for (Extension e : cfg.extensions().reversed()) {
-            try { e.close(); } catch (Exception ex) { LOG.log(System.Logger.Level.WARNING, "extension " + e.id() + " close threw", ex); }
-        }
-        runner.shutdownNow();
+    }
+
+    private void ensureOpen() {
+        if (closed) throw new IllegalStateException("agent is closed");
     }
 }

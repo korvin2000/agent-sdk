@@ -11,8 +11,8 @@ import sdk.agent.provider.LlmRequest;
 
 /// The one hook interface. Skills, permissions, sandboxing, git snapshotting, TODO tracking, loop
 /// detection and compaction are all implementations of this, registered into a [CompositeHooks],
-/// with zero core edits. Every call site in the engine is individually guarded: a throwing hook
-/// degrades to its stated fallback and never removes a `ToolEnd` or a tool result.
+/// with decision failures propagated rather than replaced by permissive fallbacks. Event observers
+/// remain isolated so one listener cannot prevent the others from seeing an event.
 public interface AgentHooks {
 
     AgentHooks NONE = new AgentHooks() { };

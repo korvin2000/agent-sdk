@@ -13,7 +13,7 @@ public final class StubProvider implements LlmProvider {
     @Override public LlmStream stream(LlmRequest request, Cancellation cancel) {
         Iterator<LlmStreamEvent> it = List.<LlmStreamEvent>of(
                 new LlmStreamEvent.Start(),
-                new LlmStreamEvent.Done(StopReason.STOP, Usage.EMPTY, "stub-1")).iterator();
+                new LlmStreamEvent.Done(StopReason.STOP, Usage.EMPTY, "stub-1", sdk.agent.json.Json.nil())).iterator();
         return new LlmStream() {
             @Override public LlmStreamEvent next() { return it.hasNext() ? it.next() : null; }
             @Override public void close() { }

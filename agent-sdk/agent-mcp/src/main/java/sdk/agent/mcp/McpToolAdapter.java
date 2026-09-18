@@ -1,9 +1,12 @@
 package sdk.agent.mcp;
 
+import java.util.List;
 import java.util.Objects;
 
 import io.modelcontextprotocol.spec.McpSchema;
 import sdk.agent.json.Json;
+import sdk.agent.message.ContentBlock;
+import sdk.agent.tool.ErrorKind;
 import sdk.agent.tool.ParamCodec;
 import sdk.agent.tool.Tool;
 import sdk.agent.tool.ToolInvocation;
@@ -51,6 +54,10 @@ final class McpToolAdapter implements Tool<Json> {
     @Override public ToolKind kind() { return kind; }
 
     @Override public ToolResult execute(ToolInvocation<Json> call) throws InterruptedException {
+        if (!(call.params() instanceof Json.Obj)) {
+            return new ToolResult.Err(ErrorKind.INVALID_ARGUMENTS,
+                    List.of(ContentBlock.Text.of("MCP tool arguments must be a JSON object")), Json.Null.NULL);
+        }
         return connection.call(remoteName, call.params(), call.cancel());
     }
 

@@ -1,7 +1,7 @@
 package sdk.agent.mcp;
 
 import java.net.URI;
-import java.util.List;
+import java.util.ArrayList;
 import java.util.Objects;
 import java.util.Optional;
 
@@ -34,8 +34,16 @@ final class McpContentMapper {
     }
 
     ToolResult map(McpSchema.CallToolResult result) {
-        List<ContentBlock> blocks = result.content().stream().map(this::block).toList();
-        Json structured = McpJsonBridge.toJson(result.structuredContent());
+        Object rawStructured = result.structuredContent();
+        var blocks = new ArrayList<ContentBlock>(result.content().size() + (rawStructured == null ? 0 : 1));
+        for (var content : result.content()) blocks.add(block(content));
+        Json structured = McpJsonBridge.toJson(rawStructured);
+        if (rawStructured != null) {
+            String canonical = structured.toText();
+            boolean alreadyVisible = blocks.stream()
+                    .anyMatch(b -> b instanceof ContentBlock.Text t && t.text().equals(canonical));
+            if (!alreadyVisible) blocks.add(ContentBlock.Text.of(canonical));
+        }
         return Boolean.TRUE.equals(result.isError())
                 ? new ToolResult.Err(ErrorKind.TOOL_REPORTED, blocks, structured)
                 : new ToolResult.Ok(blocks, structured);

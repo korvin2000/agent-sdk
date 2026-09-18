@@ -10,9 +10,8 @@ import sdk.agent.message.Usage;
 /// opaque: a text delta may split a surrogate pair and an arguments fragment is partial JSON, so
 /// neither is inspected before its `*End`.
 ///
-/// `ToolCallStart.initialArguments` and `ToolCallDelta.replace` exist for one rule: when the
-/// assembled arguments fail to parse, the start snapshot is a fallback **only if the stream did
-/// not stall** — otherwise a truncated `replace=true` delta would make the engine act on stale data.
+/// `ToolCallStart.initialArguments` is used only when no argument fragments arrive. Once a provider
+/// sends fragments, the assembled text is authoritative and malformed JSON is rejected by binding.
 public sealed interface LlmStreamEvent {
 
     record Start()                                                                     implements LlmStreamEvent { }
@@ -26,7 +25,7 @@ public sealed interface LlmStreamEvent {
     record ToolCallDelta(int index, String argumentsFragment, boolean replace)         implements LlmStreamEvent { }
     record ToolCallEnd(int index, ContentBlock.ToolCall call)                          implements LlmStreamEvent { }
     /// Terminal.
-    record Done(StopReason reason, Usage usage, String responseId)                     implements LlmStreamEvent { }
+    record Done(StopReason reason, Usage usage, String responseId, Json providerData)   implements LlmStreamEvent { }
     /// Terminal, in-band: the one shape for every provider-side failure.
     record Failed(StopReason reason, String message)                                   implements LlmStreamEvent { }
 

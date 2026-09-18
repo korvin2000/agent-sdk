@@ -3,6 +3,7 @@ package sdk.agent;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.ExecutionException;
@@ -57,47 +58,58 @@ final class ToolFunnel {
     }
 
     /// Results are index-aligned with `batch`.
-    List<ToolResultMessage> runBatch(List<ContentBlock.ToolCall> batch, boolean parallel) throws InterruptedException {
+    List<ToolResultMessage> runBatch(List<ContentBlock.ToolCall> batch, boolean parallel) {
         int n = batch.size();
         var prepared = new ArrayList<Prepare>(n);
-        for (ContentBlock.ToolCall call : batch) {                                  // phase 1
+        for (ContentBlock.ToolCall call : batch) {
             emit.accept(new AgentEvent.ToolStart(run.runId(), run.turnIndex(), now(), call.id(), call.name(), call.arguments()));
-            prepared.add(prepare(call));
+            try {
+                prepared.add(deps.cancel().isCancelled() ? new Prepare.Immediate(cancelled()) : prepare(call));
+            } catch (RuntimeException failure) {
+                prepared.add(immediate(ErrorKind.EXECUTION_FAILED, describe(failure)));
+            }
         }
 
         List<ToolResult> results = new ArrayList<>(Collections.nCopies(n, null));
-        long runnable = prepared.stream().filter(Prepare.Prepared.class::isInstance).count();
-        if (parallel && runnable > 1) {                                             // phase 2, concurrent
-            try (var fork = Fork.open(); var _ = deps.cancel().onCancel(fork::cancelAll)) {
-                List<Fork.Handle<ToolResult>> handles = new ArrayList<>(Collections.nCopies(n, null));
+        var progress = new Progress();
+        try (var fork = Fork.open();
+             var _ = deps.cancel().onCancel(() -> { progress.close(); fork.cancelAll(); })) {
+            List<Fork.Handle<ToolResult>> handles = new ArrayList<>(Collections.nCopies(n, null));
+            try {
                 for (int i = 0; i < n; i++) {
-                    if (prepared.get(i) instanceof Prepare.Prepared<?> p) {
-                        ContentBlock.ToolCall call = batch.get(i);
-                        handles.set(i, fork.fork(call.name() + "#" + call.id(), () -> execute(p, call)));
+                    switch (prepared.get(i)) {
+                        case Prepare.Immediate(var result) -> results.set(i, result);
+                        case Prepare.Prepared<?> p -> {
+                            if (deps.cancel().isCancelled()) {
+                                results.set(i, cancelled());
+                            } else {
+                                ContentBlock.ToolCall call = batch.get(i);
+                                var handle = fork.fork(call.name() + "#" + call.id(), () -> execute(p, call, progress));
+                                handles.set(i, handle);
+                                if (!parallel) results.set(i, await(handle));
+                            }
+                        }
                     }
                 }
-                for (int i = 0; i < n; i++) {
-                    results.set(i, switch (prepared.get(i)) {
-                        case Prepare.Immediate(var r) -> r;
-                        case Prepare.Prepared<?> _   -> await(handles.get(i));
-                    });
+                if (parallel) {
+                    for (int i = 0; i < n; i++) {
+                        if (handles.get(i) != null) results.set(i, await(handles.get(i)));
+                    }
                 }
-            }
-        } else {                                                                    // phase 2, inline
-            for (int i = 0; i < n; i++) {
-                ContentBlock.ToolCall call = batch.get(i);
-                results.set(i, switch (prepared.get(i)) {
-                    case Prepare.Immediate(var r) -> r;
-                    case Prepare.Prepared<?> p   -> executeInline(p, call);
-                });
+            } finally {
+                progress.close();
             }
         }
 
         var out = new ArrayList<ToolResultMessage>(n);
-        for (int i = 0; i < n; i++) {                                               // phase 3, by index
+        for (int i = 0; i < n; i++) {
             ContentBlock.ToolCall call = batch.get(i);
             ToolResult result = results.get(i);
-            if (prepared.get(i) instanceof Prepare.Prepared<?> p) result = applyAfterToolCall(call, p.arguments(), result);
+            if (!deps.cancel().isCancelled() && prepared.get(i) instanceof Prepare.Prepared<?> p) {
+                result = applyAfterToolCall(call, p.arguments(), result);
+            } else if (deps.cancel().isCancelled() && prepared.get(i) instanceof Prepare.Prepared<?>) {
+                result = cancelled();
+            }
             out.add(emitOutcome(call, result));
         }
         return out;
@@ -106,10 +118,12 @@ final class ToolFunnel {
     // ---- stage 1 -----------------------------------------------------------------------------
 
     private Prepare prepare(ContentBlock.ToolCall call) {
-        String preflight = run.turn().preflight().get(call.id());
-        if (preflight != null) return immediate(ErrorKind.INVALID_ARGUMENTS, preflight);
         Optional<Tool<?>> tool = deps.tools().resolve(call.name());
         if (tool.isEmpty()) return immediate(ErrorKind.TOOL_NOT_FOUND, ToolMessages.TOOL_NOT_FOUND.formatted(call.name()));
+        if (!run.turn().allowedTools().contains(call.name())) {
+            return immediate(ErrorKind.BLOCKED, "tool was not advertised for this turn: " + call.name());
+        }
+        if (call.arguments() == Json.Null.NULL) return immediate(ErrorKind.INVALID_ARGUMENTS, ToolMessages.ARGS_INVALID_JSON);
         return prepareTyped(tool.get(), call);
     }
 
@@ -117,22 +131,23 @@ final class ToolFunnel {
         Json arguments;
         try {
             arguments = tool.prepareArguments(call.arguments());
-        } catch (Throwable t) {
+        } catch (RuntimeException t) {
             return immediate(ErrorKind.INVALID_ARGUMENTS, t.getMessage() != null ? t.getMessage() : describe(t));
         }
         P bound;
         try {
             bound = tool.params().bind(arguments);
         } catch (ArgumentException e) {
-            return immediate(ErrorKind.INVALID_ARGUMENTS,
-                    run.turn().stalled() ? ToolMessages.ARGS_FAILED_VALIDATION_AFTER_STALL : e.render(call.name()));
+            return immediate(ErrorKind.INVALID_ARGUMENTS, e.render(call.name()));
         } catch (RuntimeException e) {
             return immediate(ErrorKind.INVALID_ARGUMENTS, describe(e));
         }
         ToolDecision decision;
         try {
-            decision = deps.hooks().beforeToolCall(new BeforeToolCall(assistant, call, call.arguments(), arguments, ctx), deps.cancel());
-        } catch (Throwable t) {
+            decision = Objects.requireNonNull(deps.hooks().beforeToolCall(
+                    new BeforeToolCall(assistant, call, call.arguments(), arguments, ctx), deps.cancel()),
+                    "beforeToolCall returned null");
+        } catch (RuntimeException t) {
             return immediate(ErrorKind.HOOK_FAILED, describe(t));
         }
         switch (decision) {
@@ -153,39 +168,48 @@ final class ToolFunnel {
 
     // ---- stage 2 -----------------------------------------------------------------------------
 
-    private <P> ToolResult execute(Prepare.Prepared<P> p, ContentBlock.ToolCall call) {
+    private <P> ToolResult execute(Prepare.Prepared<P> p, ContentBlock.ToolCall call, Progress progress) {
         try {
+            if (deps.cancel().isCancelled()) return cancelled();
             var invocation = new ToolInvocation<>(call.id(), call.name(), p.bound(), p.arguments(), deps.cancel(),
-                    partial -> emit.accept(new AgentEvent.ToolUpdate(run.runId(), run.turnIndex(), now(), call.id(), call.name(), partial)));
+                    partial -> progress.update(call, partial));
             ToolResult r = p.tool().execute(invocation);
             return r == null ? new ToolResult.Ok(List.of(), Json.Null.NULL) : r;   // empty → "(no output)" at the exit
-        } catch (Throwable t) {
+        } catch (Exception t) {
             return failure(t, call);
         }
     }
 
-    /// Inline execution on the driver thread still gets the interrupt channel: the registration
-    /// lives exactly as long as the call, and the flag is cleared afterwards so the engine's own
-    /// blocking operations never see a stale interrupt.
-    private <P> ToolResult executeInline(Prepare.Prepared<P> p, ContentBlock.ToolCall call) {
-        try (var _ = deps.cancel().interruptOnCancel(Thread.currentThread())) {
-            return execute(p, call);
-        } finally {
-            if (Thread.interrupted() && !deps.cancel().isCancelled()) Thread.currentThread().interrupt();
+    /// One gate per batch: no callback that raced settlement may publish after ToolEnd.
+    private final class Progress {
+        private boolean open = true;
+
+        synchronized void update(ContentBlock.ToolCall call, ToolResult partial) {
+            if (open && !deps.cancel().isCancelled()) {
+                emit.accept(new AgentEvent.ToolUpdate(run.runId(), run.turnIndex(), now(), call.id(), call.name(), partial));
+            }
         }
+
+        synchronized void close() { open = false; }
     }
 
-    private ToolResult await(Fork.Handle<ToolResult> handle) throws InterruptedException {
+    private ToolResult await(Fork.Handle<ToolResult> handle) {
         try {
             return handle.get();
         } catch (ExecutionException e) {
             return ToolResult.error(ErrorKind.EXECUTION_FAILED, describe(e.getCause()));
         } catch (CancellationException _) {
-            return ToolResult.error(ErrorKind.CANCELLED, ToolMessages.CANCELLED);
-        } catch (InterruptedException e) {
+            return cancelled();
+        } catch (InterruptedException _) {
             handle.cancel();
-            throw e;
+            deps.cancel().cancel();
+            Thread.currentThread().interrupt();
+            return cancelled();
         }
+    }
+
+    private static ToolResult cancelled() {
+        return ToolResult.error(ErrorKind.CANCELLED, ToolMessages.CANCELLED);
     }
 
     private ToolResult failure(Throwable t, ContentBlock.ToolCall call) {
@@ -201,13 +225,14 @@ final class ToolFunnel {
     // ---- stage 3 -----------------------------------------------------------------------------
 
     private ToolResult applyAfterToolCall(ContentBlock.ToolCall call, Json arguments, ToolResult result) {
-        Optional<ToolOverride> override;
         try {
-            override = deps.hooks().afterToolCall(new AfterToolCall(assistant, call, arguments, result, result.isError(), ctx), deps.cancel());
-        } catch (Throwable _) {
-            override = Optional.empty();                 // "the override did not apply", never "the call vanished"
+            Optional<ToolOverride> override = Objects.requireNonNull(deps.hooks().afterToolCall(
+                    new AfterToolCall(assistant, call, arguments, result, result.isError(), ctx), deps.cancel()),
+                    "afterToolCall returned null");
+            return override.map(o -> o.applyTo(result)).orElse(result);
+        } catch (RuntimeException failure) {
+            return ToolResult.error(ErrorKind.HOOK_FAILED, describe(failure));
         }
-        return override == null ? result : override.map(o -> o.applyTo(result)).orElse(result);
     }
 
     // ---- stage 4: always reached -------------------------------------------------------------

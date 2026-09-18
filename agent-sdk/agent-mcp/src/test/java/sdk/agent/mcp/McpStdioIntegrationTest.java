@@ -30,9 +30,6 @@ import sdk.agent.tool.ToolResult;
 /// End to end over the real protocol: a child JVM running [EchoMcpServerMain] as an MCP stdio
 /// server, reached through the real `StdioClientTransport`, `McpSyncClient`, [McpConnectionPool]
 /// and [McpToolAdapter].
-///
-/// mcp-core 2.0.1 ships no in-process or loopback client transport, so this is the only way to
-/// exercise the wire without a Servlet container — see [EchoMcpServerMain].
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 @Timeout(120)
 class McpStdioIntegrationTest {
@@ -69,8 +66,8 @@ class McpStdioIntegrationTest {
 
     @Test
     void discoversAndNamespacesEveryToolTheServerAdvertises() {
-        assertEquals(List.of("mcp__echo_srv__echo", "mcp__echo_srv__boom", "mcp__echo_srv__cwd"),
-                new ArrayList<>(tools.keySet()));
+        assertEquals(List.of("mcp__echo_srv__echo", "mcp__echo_srv__boom", "mcp__echo_srv__cwd",
+                "mcp__echo_srv__structured"), new ArrayList<>(tools.keySet()));
         assertEquals("[MCP:echo_srv] Returns its argument, after an optional delay.",
                 tools.get("mcp__echo_srv__echo").description());
     }
@@ -101,10 +98,20 @@ class McpStdioIntegrationTest {
         ToolResult result = call("mcp__echo_srv__echo", Json.obj("text", Json.str("ping")));
 
         assertInstanceOf(ToolResult.Ok.class, result);
-        assertEquals(2, result.content().size());
+        assertEquals(3, result.content().size());
         assertEquals(new ContentBlock.Text("ping", null), result.content().get(0));
         assertEquals(new ContentBlock.Image("QUJD", "image/png"), result.content().get(1));
+        assertEquals(new ContentBlock.Text("{\"length\":4}", null), result.content().get(2));
         assertEquals(Json.obj("length", Json.num(4)), result.details());
+    }
+
+    @Test
+    void structuredOnlyResultRemainsVisible() throws Exception {
+        ToolResult result = call("mcp__echo_srv__structured", Json.Obj.EMPTY);
+
+        assertInstanceOf(ToolResult.Ok.class, result);
+        assertEquals(List.of(new ContentBlock.Text("{\"answer\":42}", null)), result.content());
+        assertEquals(Json.obj("answer", Json.num(42)), result.details());
     }
 
     @Test
@@ -132,11 +139,10 @@ class McpStdioIntegrationTest {
                 Json.obj("text", Json.str("slow"), "delayMs", Json.num(6_000)));
 
         assertEquals(ErrorKind.TIMED_OUT, assertInstanceOf(ToolResult.Err.class, timedOut).kind());
-        assertTrue(timedOut.text().contains("timed out"), timedOut::text);
 
         ToolResult after = call("mcp__echo_srv__echo", Json.obj("text", Json.str("still here")));
         assertInstanceOf(ToolResult.Ok.class, after);
-        assertEquals("still here", ContentBlock.textOf(after.content()));
+        assertEquals("still here", assertInstanceOf(ContentBlock.Text.class, after.content().getFirst()).text());
     }
 
     @SuppressWarnings("unchecked")

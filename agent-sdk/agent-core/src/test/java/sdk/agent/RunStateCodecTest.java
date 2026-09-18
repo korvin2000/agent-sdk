@@ -4,17 +4,15 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
-import java.net.URI;
 import java.time.Duration;
 import java.time.Instant;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 import org.junit.jupiter.api.Test;
 
-import sdk.agent.event.RunOutcome;
 import sdk.agent.json.Json;
 import sdk.agent.message.AgentMessage;
 import sdk.agent.message.AgentMessageCodec;
@@ -27,6 +25,7 @@ import sdk.agent.message.ToolResultMessage;
 import sdk.agent.message.Usage;
 import sdk.agent.message.UserMessage;
 import sdk.agent.turn.TurnPhase;
+import sdk.agent.turn.OpenBlock;
 import sdk.agent.turn.TurnState;
 
 class RunStateCodecTest {
@@ -36,20 +35,16 @@ class RunStateCodecTest {
 
     private static RunState sample() {
         var call = new ContentBlock.ToolCall("c1", "read", Json.parse("{\"path\":\"a.txt\"}"), "sig");
-        var assistant = new AssistantMessage(List.of(new ContentBlock.Thinking("hm", "s", false), ContentBlock.Text.of("hi"), call),
-                MODEL, "resp-1", Usage.tokens(10, 5), StopReason.TOOL_USE, null, AT);
+        var pending = new ContentBlock.ToolCall("c2", "write", Json.Obj.EMPTY, null);
+        var replay = Json.obj("itemId", Json.str("item-1"), "encrypted", Json.str("blob"));
+        var assistant = new AssistantMessage(List.of(new ContentBlock.Thinking("hm", "s", false), ContentBlock.Text.of("hi"), call, pending), MODEL, "resp-1", Usage.tokens(10, 5), StopReason.TOOL_USE, null, replay, AT);
         var result = new ToolResultMessage("c1", "read", List.of(ContentBlock.Text.of("content")), Json.obj("k", Json.num(1)), false, AT);
-        var turn = new TurnState("run-1", 1, TurnPhase.TOOLS_RUNNING, MODEL, assistant.content(), Optional.empty(),
-                new LinkedHashMap<>(), Map.of("c9", "cut off"), assistant, List.of(Optional.of(result)), true);
-        List<AgentMessage> transcript = List.of(
-                UserMessage.of("look", List.of(new ContentBlock.Image("AAAA", "image/png"))),
-                assistant, result,
-                new CustomMessage("todo.snapshot", Json.obj("tasks", Json.arr()), AT),
-                new UserMessage(List.of(new ContentBlock.Resource(URI.create("file:///x"), "text/plain", Optional.of("t"), Optional.empty()),
-                                        new ContentBlock.Audio("BBBB", "audio/wav")), AT));
-        return new RunState("run-1", Phase.TOOLS_RUNNING, 1, transcript, 1, List.of(UserMessage.text("next", AT)),
+        var turn = new TurnState("run-1", 0, TurnPhase.TOOLS_RUNNING, MODEL, Map.of(), Map.of(), Map.of(),
+                Set.of("read"), assistant, List.of(Optional.of(result), Optional.empty()), false);
+        List<AgentMessage> transcript = List.of(UserMessage.of("look", List.of(new ContentBlock.Image("AAAA", "image/png")), AT), assistant, result);
+        return new RunState("run-1", Phase.TOOLS_RUNNING, 0, transcript, 1, List.of(),
                 turn, RunLimits.DEFAULTS.withWallClock(Duration.ofMinutes(5)).withToolExecution(ToolExecutionMode.SEQUENTIAL),
-                2, 1, Usage.tokens(10, 5), AT, new RunOutcome.LimitExceeded(RunOutcome.Limit.THRASH, "d"), "hash");
+                1, 1, Usage.tokens(10, 5), AT, null, "hash");
     }
 
     @Test
@@ -60,7 +55,7 @@ class RunStateCodecTest {
         RunState back = codec.decode(Json.parse(json.toText()));
         assertEquals(original, back);
         assertEquals(json, codec.encode(back));
-        assertEquals(original.transcript().subList(1, 5), back.produced());
+        assertEquals(original.transcript().subList(1, 3), back.produced());
     }
 
     @Test
@@ -81,14 +76,53 @@ class RunStateCodecTest {
         assertInstanceOf(CustomMessage.class, opaque);
         assertEquals("marker", opaque.kind());
         assertEquals(AT, opaque.timestamp());
-
-        assertThrows(IllegalStateException.class, () -> RunStateCodec.builtIn().encodeMessage(new Marker("n", AT)));
     }
 
     @Test
-    void refusesAForeignSchemaVersion() {
+    void explicitlyRejectsSchemaTwoAndForeignVersions() {
         Json json = RunStateCodec.builtIn().encode(sample());
-        Json bumped = ((Json.Obj) json).with("schemaVersion", Json.num(99));
-        assertThrows(IllegalArgumentException.class, () -> RunStateCodec.builtIn().decode(bumped));
+        assertThrows(IllegalArgumentException.class, () -> RunStateCodec.builtIn().decode(((Json.Obj) json).with("schemaVersion", Json.num(2))));
+        assertThrows(IllegalArgumentException.class, () -> RunStateCodec.builtIn().decode(((Json.Obj) json).with("schemaVersion", Json.num(99))));
+    }
+
+    @Test
+    void requiredFieldsNeverCoerceMissingOrWrongTypesToDefaults() {
+        var codec = RunStateCodec.builtIn();
+        var state = (Json.Obj) codec.encode(sample());
+        assertThrows(IllegalArgumentException.class, () -> codec.decode(state.without("transcript")));
+        assertThrows(IllegalArgumentException.class, () -> codec.decode(state.with("pendingInjection", Json.Obj.EMPTY)));
+        assertThrows(IllegalArgumentException.class, () -> codec.decode(state.with("turnsUsed", Json.str("1"))));
+        var turn = (Json.Obj) state.get("turn").orElseThrow();
+        assertThrows(IllegalArgumentException.class, () -> codec.decode(state.with("turn", turn.without("allowedTools"))));
+        assertThrows(IllegalArgumentException.class, () -> codec.decode(state.with("turn", turn.with("stalled", Json.num(0)))));
+    }
+
+    @Test
+    void settledResultsCannotBeErasedOrRewrittenInSlots() {
+        var codec = RunStateCodec.builtIn();
+        var state = (Json.Obj) codec.encode(sample());
+        var turn = (Json.Obj) state.get("turn").orElseThrow();
+        assertThrows(IllegalArgumentException.class, () -> codec.decode(state.with("turn",
+                turn.with("slots", Json.arr(List.of(Json.nil(), Json.nil()))))));
+        var result = sample().turn().results().getFirst();
+        for (var rewritten : List.of(
+                new ToolResultMessage("other", result.toolName(), result.content(), result.details(), false, AT),
+                new ToolResultMessage(result.toolCallId(), "other", result.content(), result.details(), false, AT),
+                new ToolResultMessage(result.toolCallId(), result.toolName(), List.of(ContentBlock.Text.of("different")), result.details(), false, AT))) {
+            assertThrows(IllegalArgumentException.class, () -> codec.decode(state.with("turn",
+                    turn.with("slots", Json.arr(List.of(codec.encodeMessage(rewritten), Json.nil()))))));
+        }
+    }
+
+    @Test
+    void streamingAccumulatorsCannotBeSilentlyDroppedByEitherEncoder() {
+        var codec = RunStateCodec.builtIn();
+        var streaming = new TurnState("run-1", 0, TurnPhase.STREAMING, MODEL, Map.of(),
+                Map.of(0, OpenBlock.text(0)), Map.of(), Set.of(), null, List.of(), false);
+        assertThrows(IllegalArgumentException.class, () -> codec.encode(streaming));
+        var state = sample().toBuilder();
+        state.phase = Phase.TURN_OPENING;
+        state.turn = streaming;
+        assertThrows(IllegalArgumentException.class, () -> codec.encode(state.build()));
     }
 }

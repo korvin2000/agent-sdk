@@ -71,7 +71,7 @@ public final class AgentBuilder {
     /// `ServiceLoader` discovery — opt-in, never default: a host must be able to state which extensions are live.
     public AgentBuilder discoverExtensions()                    { discover = true; return this; }
     public AgentBuilder hook(AgentHooks h)                      { hooks.add(Objects.requireNonNull(h)); return this; }
-    /// Replace the default [TurnGuard]; `null` removes loop/budget policy entirely.
+    /// Replace the default [TurnGuard]; `null` removes response-quality policy, not engine budgets.
     public AgentBuilder turnGuard(AgentHooks guard)             { turnGuard = guard; return this; }
     /// The host's last word on the system prompt: replace the assembled one, or append to it.
     public AgentBuilder systemPromptOverride(SystemPromptOverride o) { promptOverride = o; return this; }

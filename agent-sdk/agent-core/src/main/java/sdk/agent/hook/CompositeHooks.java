@@ -15,9 +15,8 @@ import sdk.agent.message.AssistantMessage;
 import sdk.agent.provider.LlmRequest;
 import sdk.agent.tool.ToolResult;
 
-/// Folds a list of hooks into one, in registration order, with every call site individually
-/// guarded: a throwing hook is reported to `onHookError` and degrades to its stated fallback —
-/// "the rewrite did not apply", never "the tool call vanished".
+/// Folds a list of hooks in registration order. Decision hooks fail closed: a thrown or null
+/// decision is reported and propagated. Only event observation is isolated.
 ///
 /// Composition rules: `transformContext`, `beforeRequest` compose left to right (each sees the
 /// previous output); `beforeTurn` concatenates; `afterAssistant` returns the first non-`Proceed`;
@@ -45,14 +44,14 @@ public final class CompositeHooks implements AgentHooks {
         List<AgentMessage> current = messages;
         for (AgentHooks h : hooks) {
             List<AgentMessage> in = current;
-            current = safely("transformContext", () -> h.transformContext(in, cancel), in);
+            current = decide("transformContext", () -> h.transformContext(in, cancel));
         }
         return current;
     }
 
     @Override public List<AgentMessage> beforeTurn(TurnContext ctx) {
         var out = new ArrayList<AgentMessage>();
-        for (AgentHooks h : hooks) out.addAll(safely("beforeTurn", () -> h.beforeTurn(ctx), List.of()));
+        for (AgentHooks h : hooks) out.addAll(decide("beforeTurn", () -> h.beforeTurn(ctx)));
         return out;
     }
 
@@ -60,14 +59,14 @@ public final class CompositeHooks implements AgentHooks {
         LlmRequest current = request;
         for (AgentHooks h : hooks) {
             LlmRequest in = current;
-            current = safely("beforeRequest", () -> h.beforeRequest(in, ctx), in);
+            current = decide("beforeRequest", () -> h.beforeRequest(in, ctx));
         }
         return current;
     }
 
     @Override public TurnVerdict afterAssistant(AssistantMessage message, TurnContext ctx) {
         for (AgentHooks h : hooks) {
-            TurnVerdict v = safely("afterAssistant", () -> h.afterAssistant(message, ctx), TurnVerdict.PROCEED);
+            TurnVerdict v = decide("afterAssistant", () -> h.afterAssistant(message, ctx));
             if (!(v instanceof TurnVerdict.Proceed)) return v;
         }
         return TurnVerdict.PROCEED;
@@ -78,7 +77,7 @@ public final class CompositeHooks implements AgentHooks {
         boolean rewritten = false;
         for (AgentHooks h : hooks) {
             BeforeToolCall in = new BeforeToolCall(call.assistantMessage(), call.toolCall(), call.rawArguments(), current, call.ctx());
-            ToolDecision d = safely("beforeToolCall", () -> h.beforeToolCall(in, cancel), ToolDecision.ALLOW);
+            ToolDecision d = decide("beforeToolCall", () -> h.beforeToolCall(in, cancel));
             switch (d) {
                 case ToolDecision.Block b -> { return b; }
                 case ToolDecision.Allow a -> {
@@ -94,7 +93,7 @@ public final class CompositeHooks implements AgentHooks {
         boolean overridden = false;
         for (AgentHooks h : hooks) {
             AfterToolCall in = new AfterToolCall(call.assistantMessage(), call.toolCall(), call.boundArguments(), current, current.isError(), call.ctx());
-            Optional<ToolOverride> o = safely("afterToolCall", () -> h.afterToolCall(in, cancel), Optional.empty());
+            Optional<ToolOverride> o = decide("afterToolCall", () -> h.afterToolCall(in, cancel));
             if (o.isPresent()) { current = o.get().applyTo(current); overridden = true; }
         }
         if (!overridden) return Optional.empty();
@@ -102,16 +101,30 @@ public final class CompositeHooks implements AgentHooks {
     }
 
     @Override public void onEvent(AgentEvent event) {
-        for (AgentHooks h : hooks) safely("onEvent", () -> { h.onEvent(event); return null; }, null);
-    }
-
-    private <T> T safely(String name, Supplier<T> call, T fallback) {
-        try {
-            T result = call.get();
-            return result == null && fallback != null ? fallback : result;
-        } catch (Throwable t) {
-            onHookError.accept(name, t);
-            return fallback;
+        for (AgentHooks h : hooks) {
+            try {
+                h.onEvent(event);
+            } catch (Throwable failure) {
+                report("onEvent", failure);
+            }
         }
     }
+
+    private <T> T decide(String name, Supplier<T> call) {
+        try {
+            return Objects.requireNonNull(call.get(), name + " hook returned null");
+        } catch (RuntimeException | Error failure) {
+            report(name, failure);
+            throw failure;
+        }
+    }
+
+    private void report(String name, Throwable failure) {
+        try {
+            onHookError.accept(name, failure);
+        } catch (Throwable _) {
+            // Reporting cannot grant permission or replace the decision failure.
+        }
+    }
+
 }

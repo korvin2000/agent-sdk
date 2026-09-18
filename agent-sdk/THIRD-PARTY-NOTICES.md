@@ -13,11 +13,11 @@ was used only as the described *design* of path containment; nothing was transcr
 
 | Source | Licence | What is reused | Where |
 |---|---|---|---|
-| pi-mono (Mario Zechner) | MIT | `read`/`write`/`edit`/`bash` descriptions and guidelines; the truncation notices; the `edit` error strings; `Tool {name} not found`; `Tool execution was blocked`; the `Validation failed for tool "..."` block; `(no output)`; `PendingMessageQueue` semantics | `agent-core`: `sdk.agent.json.ArgumentException`, `sdk.agent.tool.ToolMessages`, `sdk.agent.MessageQueue`; `agent-tools`: `sdk.agent.tools.fs.*`, `sdk.agent.tools.shell.*`, `sdk.agent.tools.support.Truncation` |
-| nanocoder (Nano Collective) | MIT | The `write` refusal; the post-edit echo and result cap; the `bash` result frame idea and per-stream markers; `TRUNCATED_TURN_INSTRUCTION`, `FINAL_TURN_INSTRUCTION`, `CONTINUE_NUDGE`, `MALFORMED_TOOL_CALL_INSTRUCTION` | `agent-core`: `sdk.agent.hook.TurnGuard`; `agent-tools`: `sdk.agent.tools.fs.WriteTool`, `sdk.agent.tools.fs.EditTool`, `sdk.agent.tools.shell.*` |
-| kon (0xku) | MIT | Three tool-call preflight strings; `(no output)`; the default system prompt (agent name and kon-specific bullet removed) and the `# Tool usage`, `# Project Context`, `# Skills`, `# Git Context` and `# Env` blocks; the skill-command wrapper; `AGENTS.md` and skill discovery, validation and rendering rules; the built-in `init` and `review` skills (`Kon` → `agent`, `register_cmd: only`); the summarisation prompt and continue message — all shipped as markdown resources | `agent-core`: `sdk.agent.tool.ToolMessages`; `agent-tools`: `sdk.agent.tools.prompts.*`, `sdk/agent/tools/prompts/**/*.md` |
+| pi-mono (Mario Zechner) | MIT | Coding-tool design and prompt influences; `Tool {name} not found`; `Tool execution was blocked`; the `Validation failed for tool "..."` block; `(no output)`; `PendingMessageQueue` semantics | `agent-core`: `sdk.agent.json.ArgumentException`, `sdk.agent.tool.ToolMessages`, `sdk.agent.MessageQueue`; `agent-tools`: `sdk.agent.tools` |
+| nanocoder (Nano Collective) | MIT | Coding-tool refusal/output design influences; `TRUNCATED_TURN_INSTRUCTION`, `FINAL_TURN_INSTRUCTION`, `CONTINUE_NUDGE` | `agent-core`: `sdk.agent.hook.TurnGuard`; `agent-tools`: `sdk.agent.tools` |
+| kon (0xku) | MIT | Invalid-JSON tool-call string; `(no output)`; workspace instructions and prompt-section design influences | `agent-core`: `sdk.agent.tool.ToolMessages`; `agent-tools`: `sdk.agent.tools.CodingToolsExtension` |
 | mini-swe-agent (Kilian A. Lieret and Carlos E. Jimenez) | MIT | `action was not executed`; `STOPPED_WITHOUT_TOOL_CALL_INSTRUCTION` (the tool-call-less branch of `format_error_template`)| `agent-core`: `sdk.agent.tool.ToolMessages`, `sdk.agent.hook.TurnGuard` |
-| tiny-coding-agent (Dung Huynh Duc) | MIT | `LOOP_DETECTED`; the three-tier loop-detection ladder and its constants | `agent-core`: `sdk.agent.hook.TurnGuard` |
+| tiny-coding-agent (Dung Huynh Duc) | MIT | `LOOP_DETECTED`; original loop-detection design influence (now consecutive identical batches only) | `agent-core`: `sdk.agent.hook.TurnGuard` |
 
 ## MIT License — pi-mono
 

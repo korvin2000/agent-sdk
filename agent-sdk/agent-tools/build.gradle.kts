@@ -1,6 +1,6 @@
 plugins { id("sdk.java-conventions") }
 
-description = "The four base coding tools (read, write, edit, bash), path/truncation support and the kon-style system prompt (AGENTS.md, skills, git context)."
+description = "Basic read, write, edit and bash tools with workspace-aware project instructions."
 
 dependencies {
     api(project(":agent-core"))

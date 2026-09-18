@@ -1,68 +1,227 @@
 package sdk.agent;
 
 import java.io.IOException;
+import java.util.ArrayDeque;
+import java.util.Objects;
 import java.util.OptionalLong;
-import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
 import sdk.agent.concurrent.Cancellation;
 import sdk.agent.concurrent.Fork;
+import sdk.agent.provider.LlmProvider;
+import sdk.agent.provider.LlmRequest;
 import sdk.agent.provider.LlmStream;
 import sdk.agent.provider.LlmStreamEvent;
 
-/// One virtual thread drains the provider stream into a bounded queue; the sentinel is enqueued in
-/// a `finally` on every path so the consumer can never block forever. Idle timeout, backpressure
-/// and clean close-on-cancel from one primitive. Per turn: the cancellation registration is held
-/// and released in [#close], so a hundred turns do not accumulate a hundred listeners.
+/// One virtual thread opens and drains a provider stream. The bounded queue preserves provider
+/// order while a separate completion state lets cancellation wake consumers without needing space
+/// for a sentinel.
 final class ProviderPump implements AutoCloseable {
 
-    private static final Object EOS = new Object();
+    private static final int CAPACITY = 256;
 
-    private final BlockingQueue<Object> queue = new LinkedBlockingQueue<>(256);
-    private final LlmStream stream;
-    private final Fork fork;
-    private final Cancellation.Registration cancelRegistration;
+    private final Object monitor = new Object();
+    private final ArrayDeque<LlmStreamEvent> events = new ArrayDeque<>(CAPACITY);
+    private final LlmProvider provider;
+    private final LlmRequest request;
+    private final Cancellation cancellation;
+    private final Fork fork = Fork.open();
+    private final Fork.Handle<Void> cleanup;
+    private final Fork.Handle<Void> producer;
+    private final Cancellation.Registration cancellationRegistration;
 
-    ProviderPump(LlmStream stream, Cancellation cancel) {
-        this.stream = stream;
-        this.fork = Fork.open();
-        this.cancelRegistration = cancel.onCancel(stream::close);
-        fork.run(() -> {
-            try {
-                LlmStreamEvent e;
-                while ((e = stream.next()) != null) queue.put(e);
-            } catch (Throwable t) {
-                put(t);
-            } finally {
-                put(EOS);
-            }
-        });
+    private LlmStream stream;
+    private Throwable failure;
+    private boolean opened;
+    private boolean complete;
+    private boolean cleanupStarted;
+    private boolean producerFinished;
+    private volatile boolean closed;
+    private boolean cleanupRequested;
+    private boolean closeClaimed;
+
+    ProviderPump(LlmProvider provider, LlmRequest request, Cancellation cancellation) {
+        this.provider = Objects.requireNonNull(provider, "provider");
+        this.request = Objects.requireNonNull(request, "request");
+        this.cancellation = Objects.requireNonNull(cancellation, "cancellation");
+        cleanup = fork.run(this::cleanup);
+        producer = fork.run(this::produce);
+        cancellationRegistration = cancellation.onCancel(this::cancelled);
+    }
+
+    /// Waits until the provider opened its stream. Opening failures use the same channel as reads.
+    void awaitOpen() throws IOException, InterruptedException {
+        synchronized (monitor) {
+            while (!opened && failure == null && !complete && !stopping()) monitor.wait();
+            if (stopping()) throw cancelledException();
+            if (opened) return;
+            if (failure != null) throw asIo(failure);
+            throw new IOException("provider stream ended before opening");
+        }
     }
 
     /// Returns `null` at end of stream.
     /// @throws TimeoutException when `idleMillis` elapses with no event
     LlmStreamEvent next(OptionalLong idleMillis) throws InterruptedException, TimeoutException, IOException {
-        Object o = idleMillis.isPresent() ? queue.poll(idleMillis.getAsLong(), TimeUnit.MILLISECONDS) : queue.take();
-        if (o == null) throw new TimeoutException("no provider event within " + idleMillis.getAsLong() + " ms");
-        if (o == EOS) return null;
-        if (o instanceof Throwable t) throw asIo(t);
-        return (LlmStreamEvent) o;
+        long deadline = idleMillis.isPresent()
+                ? System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(idleMillis.getAsLong()) : 0;
+        synchronized (monitor) {
+            for (;;) {
+                if (stopping()) throw cancelledException();
+                LlmStreamEvent event = events.pollFirst();
+                if (event != null) {
+                    monitor.notifyAll();
+                    return event;
+                }
+                if (failure != null) throw asIo(failure);
+                if (complete) return null;
+                if (idleMillis.isEmpty()) {
+                    monitor.wait();
+                    continue;
+                }
+                long remaining = deadline - System.nanoTime();
+                if (remaining <= 0) throw new TimeoutException("no provider event within " + idleMillis.getAsLong() + " ms");
+                TimeUnit.NANOSECONDS.timedWait(monitor, remaining);
+            }
+        }
     }
 
     @Override public void close() {
-        cancelRegistration.close();
-        stream.close();
+        synchronized (monitor) {
+            if (closed) return;
+            closed = true;
+            cleanupRequested = true;
+            monitor.notifyAll();
+        }
+        cancellationRegistration.close();
+        producer.cancel();
         fork.close();                                   // bounded; never hangs
     }
 
-    private void put(Object item) {
+    private void produce() {
+        LlmStream openedStream = null;
         try {
-            queue.put(item);
-        } catch (InterruptedException _) {
-            Thread.currentThread().interrupt();
+            awaitCleanup();
+            if (stopping()) return;
+            openedStream = provider.stream(request, cancellation);
+            if (openedStream == null) throw new IOException("provider returned no stream");
+
+            boolean closeLate;
+            synchronized (monitor) {
+                stream = openedStream;
+                closeLate = stopping();
+                if (!closeLate) {
+                    opened = true;
+                }
+                monitor.notifyAll();
+            }
+            if (closeLate) {
+                closeDirectly(openedStream);
+                return;
+            }
+
+            while (!stopping()) {
+                LlmStreamEvent event = openedStream.next();
+                if (stopping()) return;
+                if (event == null) {
+                    complete();
+                    return;
+                }
+                if (!publish(event) || event.terminal()) return;
+            }
+        } catch (Throwable t) {
+            if (!stopping()) fail(t);
+        } finally {
+            requestStreamClose();
+            if (openedStream != null) closeDirectly(openedStream);
+            synchronized (monitor) {
+                producerFinished = true;
+                monitor.notifyAll();
+            }
         }
+    }
+
+    private boolean publish(LlmStreamEvent event) throws InterruptedException {
+        synchronized (monitor) {
+            while (events.size() == CAPACITY && !stopping()) monitor.wait();
+            if (stopping()) return false;
+            events.addLast(event);
+            if (event.terminal()) complete = true;
+            monitor.notifyAll();
+            return true;
+        }
+    }
+
+    private void complete() {
+        synchronized (monitor) {
+            complete = true;
+            monitor.notifyAll();
+        }
+    }
+
+    private void fail(Throwable t) {
+        synchronized (monitor) {
+            failure = t;
+            complete = true;
+            monitor.notifyAll();
+        }
+    }
+
+    private void cancelled() {
+        synchronized (monitor) {
+            cleanupRequested = true;
+            monitor.notifyAll();
+        }
+        producer.cancel();
+    }
+
+    private boolean stopping() { return closed || cancellation.isCancelled(); }
+
+    private InterruptedException cancelledException() {
+        return new InterruptedException(closed ? "provider pump closed" : "provider stream cancelled");
+    }
+    private void cleanup() {
+        LlmStream owned;
+        synchronized (monitor) {
+            cleanupStarted = true;
+            monitor.notifyAll();
+            for (;;) {
+                try {
+                    if (closeClaimed) return;
+                    if (stream != null && cleanupRequested) {
+                        closeClaimed = true;
+                        owned = stream;
+                        break;
+                    }
+                    if (producerFinished || complete || (stopping() && stream == null)) return;
+                    monitor.wait();
+                } catch (InterruptedException _) {
+                    // Re-check ownership and stopping state before abandoning cleanup.
+                }
+            }
+        }
+        owned.close();
+    }
+
+    private void awaitCleanup() throws InterruptedException {
+        synchronized (monitor) {
+            while (!cleanupStarted) monitor.wait();
+        }
+    }
+
+    private void requestStreamClose() {
+        synchronized (monitor) {
+            cleanupRequested = true;
+            monitor.notifyAll();
+        }
+    }
+    private void closeDirectly(LlmStream owned) {
+        synchronized (monitor) {
+            if (closeClaimed) return;
+            closeClaimed = true;
+        }
+        owned.close();                                  // late open or cleanup-worker fallback
     }
 
     private static IOException asIo(Throwable t) {
